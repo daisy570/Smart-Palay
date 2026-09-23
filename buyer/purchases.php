@@ -1,0 +1,2680 @@
+<?php
+require_once __DIR__ . '/../config/database.php';
+
+/* --------------------------------------------------------------
+   Auth guards
+-------------------------------------------------------------- */
+if (!isLoggedIn()) {
+    header('Location: ' . BASE_URL . 'auth/login.php');
+    exit;
+}
+
+if (($_SESSION['role'] ?? '') !== 'buyer') {
+    header('Location: ' . BASE_URL . 'index.php');
+    exit;
+}
+
+$userId   = (int) $_SESSION['user_id'];
+$fullName = $_SESSION['full_name'] ?? 'Daisy Joy Dula';
+$email    = $_SESSION['email'] ?? '';
+
+/* --------------------------------------------------------------
+   Helpers
+-------------------------------------------------------------- */
+function peso($n) { return '₱' . number_format((float) $n, 2); }
+function kg($n)   { return number_format((float) $n, 2) . ' kg'; }
+function niceDate($s) {
+    if (!$s) return '—';
+    $t = strtotime($s);
+    return $t ? date('M j, Y', $t) : '—';
+}
+function niceDateTime($s) {
+    if (!$s) return '—';
+    $t = strtotime($s);
+    return $t ? date('M j, Y · g:i A', $t) : '—';
+}
+
+/* --------------------------------------------------------------
+   Logo
+-------------------------------------------------------------- */
+$logoFileName = '5e861afa-4a95-423a-b004-d69c59fa88dc.png';
+$logoDiskPath = __DIR__ . '/../images/' . $logoFileName;
+$smartPalayLogo = is_file($logoDiskPath)
+    ? BASE_URL . 'images/' . rawurlencode($logoFileName)
+    : '';
+
+$firstName = sanitize(explode(' ', $fullName)[0]);
+
+/* --------------------------------------------------------------
+   Filters & pagination
+-------------------------------------------------------------- */
+$search      = trim((string) ($_GET['q'] ?? ''));
+$statusFilter= strtolower(trim((string) ($_GET['status'] ?? 'all')));
+$dateFrom    = trim((string) ($_GET['from'] ?? ''));
+$dateTo      = trim((string) ($_GET['to'] ?? ''));
+$sortKey     = (string) ($_GET['sort'] ?? 'created_at');
+$sortDir     = strtolower((string) ($_GET['dir'] ?? 'desc')) === 'asc' ? 'ASC' : 'DESC';
+
+$allowedSorts = [
+    'created_at'   => 'created_at',
+    'reference_no' => 'reference_no',
+    'seller_name'  => 'seller_name',
+    'weight_kg'    => 'weight_kg',
+    'total_amount' => 'total_amount',
+    'balance'      => 'balance',
+    'status'       => 'status',
+];
+if (!isset($allowedSorts[$sortKey])) $sortKey = 'created_at';
+$orderBy = $allowedSorts[$sortKey] . ' ' . $sortDir;
+
+$perPage = 10;
+$page    = max(1, (int) ($_GET['page'] ?? 1));
+
+$where  = ['buyer_id = ?'];
+$params = [$userId];
+
+if ($search !== '') {
+    $where[] = '(reference_no LIKE ? OR seller_name LIKE ? OR notes LIKE ?)';
+    $like    = '%' . $search . '%';
+    array_push($params, $like, $like, $like);
+}
+
+$validStatuses = ['paid', 'partial', 'unpaid', 'pending'];
+if ($statusFilter !== 'all' && in_array($statusFilter, $validStatuses, true)) {
+    $where[]  = 'LOWER(status) = ?';
+    $params[] = $statusFilter;
+}
+
+if ($dateFrom !== '') {
+    $where[]  = 'DATE(created_at) >= ?';
+    $params[] = $dateFrom;
+}
+if ($dateTo !== '') {
+    $where[]  = 'DATE(created_at) <= ?';
+    $params[] = $dateTo;
+}
+
+$whereSql = implode(' AND ', $where);
+
+/* --------------------------------------------------------------
+   Counts & list
+-------------------------------------------------------------- */
+$purchases   = [];
+$totalRows   = 0;
+$totalPages  = 1;
+
+$stats = [
+    'all'     => 0,
+    'paid'    => 0,
+    'partial' => 0,
+    'unpaid'  => 0,
+    'pending' => 0,
+];
+
+$summary = [
+    'total_amount' => 0,
+    'total_paid'   => 0,
+    'total_balance'=> 0,
+    'total_kg'     => 0,
+];
+
+try {
+    $countWhere  = ['buyer_id = ?'];
+    $countParams = [$userId];
+    if ($search !== '') {
+        $countWhere[] = '(reference_no LIKE ? OR seller_name LIKE ? OR notes LIKE ?)';
+        array_push($countParams, $like, $like, $like);
+    }
+    if ($dateFrom !== '') { $countWhere[] = 'DATE(created_at) >= ?'; $countParams[] = $dateFrom; }
+    if ($dateTo   !== '') { $countWhere[] = 'DATE(created_at) <= ?'; $countParams[] = $dateTo; }
+    $countWhereSql = implode(' AND ', $countWhere);
+
+    $stmt = $pdo->prepare("SELECT LOWER(status) AS st, COUNT(*) AS c FROM purchases WHERE {$countWhereSql} GROUP BY LOWER(status)");
+    $stmt->execute($countParams);
+    foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $row) {
+        $st = $row['st'] ?: 'pending';
+        if (!isset($stats[$st])) $stats[$st] = 0;
+        $stats[$st] += (int) $row['c'];
+        $stats['all'] += (int) $row['c'];
+    }
+} catch (Throwable $e) {}
+
+try {
+    $stmt = $pdo->prepare("
+        SELECT
+            COALESCE(SUM(total_amount), 0) AS total_amount,
+            COALESCE(SUM(amount_paid), 0)  AS total_paid,
+            COALESCE(SUM(balance), 0)      AS total_balance,
+            COALESCE(SUM(weight_kg), 0)    AS total_kg
+        FROM purchases
+        WHERE {$whereSql}
+    ");
+    $stmt->execute($params);
+    $row = $stmt->fetch(PDO::FETCH_ASSOC);
+    if ($row) {
+        $summary['total_amount']  = (float) $row['total_amount'];
+        $summary['total_paid']    = (float) $row['total_paid'];
+        $summary['total_balance'] = (float) $row['total_balance'];
+        $summary['total_kg']      = (float) $row['total_kg'];
+    }
+} catch (Throwable $e) {}
+
+try {
+    $stmt = $pdo->prepare("SELECT COUNT(*) FROM purchases WHERE {$whereSql}");
+    $stmt->execute($params);
+    $totalRows  = (int) $stmt->fetchColumn();
+    $totalPages = max(1, (int) ceil($totalRows / $perPage));
+    if ($page > $totalPages) $page = $totalPages;
+    $offset = ($page - 1) * $perPage;
+
+    $stmt = $pdo->prepare("
+        SELECT id, reference_no, seller_name, weight_kg, price_per_kg,
+               total_amount, amount_paid, balance, status, notes, created_at
+        FROM purchases
+        WHERE {$whereSql}
+        ORDER BY {$orderBy}
+        LIMIT {$perPage} OFFSET {$offset}
+    ");
+    $stmt->execute($params);
+    $purchases = $stmt->fetchAll(PDO::FETCH_ASSOC);
+} catch (Throwable $e) {
+    $purchases = [];
+}
+
+/* --------------------------------------------------------------
+   Sellers list (for modal)
+-------------------------------------------------------------- */
+$sellersList = [];
+try {
+    $stmt = $pdo->prepare("
+        SELECT DISTINCT seller_name
+        FROM purchases
+        WHERE buyer_id = ? AND seller_name IS NOT NULL AND seller_name <> ''
+        ORDER BY seller_name ASC
+    ");
+    $stmt->execute([$userId]);
+    $sellersList = $stmt->fetchAll(PDO::FETCH_COLUMN);
+} catch (Throwable $e) {}
+
+/* --------------------------------------------------------------
+   Build query string helper (preserving filters)
+-------------------------------------------------------------- */
+function qs(array $overrides = []): string {
+    $params = array_merge($_GET, $overrides);
+    foreach ($params as $k => $v) {
+        if ($v === '' || $v === null) unset($params[$k]);
+    }
+    return http_build_query($params);
+}
+
+function statusMeta(string $st): array {
+    $st = strtolower($st ?: 'pending');
+    switch ($st) {
+        case 'paid':    return ['sp-badge-paid',    'bi-check-circle-fill', 'Paid'];
+        case 'partial': return ['sp-badge-partial', 'bi-circle-half',        'Partial'];
+        case 'unpaid':  return ['sp-badge-unpaid',  'bi-x-circle-fill',     'Unpaid'];
+        default:        return ['sp-badge-pending', 'bi-hourglass-split',   'Pending'];
+    }
+}
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="theme-color" content="#B0641E">
+    <title>My Purchases | SmartPalay</title>
+
+    <?php if ($smartPalayLogo): ?>
+        <link rel="icon" type="image/png" href="<?= $smartPalayLogo ?>">
+    <?php endif; ?>
+
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.1/font/bootstrap-icons.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600;9..144,700&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500;600&display=swap" rel="stylesheet">
+
+    <style>
+        /* ============================================================
+           SmartPalay — Purchases (Premium Edition)
+           ============================================================ */
+        :root {
+            --gold:        #B0641E;
+            --gold-2:      #C97628;
+            --gold-3:      #E8B05A;
+            --gold-4:      #F4C87A;
+            --gold-soft:   #FBF1DC;
+
+            --brown:       #4A2C10;
+            --brown-2:     #6B4423;
+            --brown-3:     #8A5A30;
+
+            --cream:       #FBF6EA;
+            --cream-2:     #FDFAF1;
+            --paper:       #FAF3E5;
+            --paper-2:     #F2E7D0;
+
+            --line:        #EADFC8;
+            --line-2:      #DDCDA8;
+            --line-3:      #C9B68A;
+
+            --text:        #3A2A18;
+            --text-2:      #6B5A44;
+            --text-3:      #96856E;
+
+            --success:     #2E7D32;
+            --success-bg:  #EAF7EC;
+            --success-bd:  #BEE0C2;
+
+            --warn:        #7A5A0F;
+            --warn-bg:     #FCF3D6;
+            --warn-bd:     #EBD79A;
+
+            --danger:      #A23A1A;
+            --danger-bg:   #FBEDE6;
+            --danger-bd:   #EFC6B0;
+
+            --info:        #1E5FA8;
+            --info-bg:     #E8F0FA;
+
+            --sidebar-w:   260px;
+        }
+
+        *, *::before, *::after { box-sizing: border-box; }
+        html, body { height: 100%; margin: 0; }
+
+        body.sp-dash {
+            font-family: 'Inter', system-ui, -apple-system, sans-serif;
+            color: var(--text);
+            background:
+                radial-gradient(circle at 100% 0%, rgba(232, 176, 90, .14), transparent 42%),
+                radial-gradient(circle at 0% 100%, rgba(184, 92, 46, .08), transparent 42%),
+                var(--cream-2);
+            -webkit-font-smoothing: antialiased;
+            text-rendering: optimizeLegibility;
+            line-height: 1.5;
+            min-height: 100vh;
+            display: flex;
+        }
+
+        /* ============================================================
+           SIDEBAR (identical to dashboard)
+           ============================================================ */
+        .sp-sidebar {
+            position: fixed;
+            top: 0; left: 0; bottom: 0;
+            width: var(--sidebar-w);
+            z-index: 200;
+            display: flex; flex-direction: column;
+            background:
+                radial-gradient(circle at 20% 10%, rgba(232, 176, 90, .2), transparent 55%),
+                radial-gradient(circle at 80% 90%, rgba(184, 92, 46, .14), transparent 55%),
+                linear-gradient(180deg, #4A2C10 0%, #2A1E10 100%);
+            color: #fff;
+            border-right: 1px solid rgba(232, 176, 90, .18);
+            overflow: hidden;
+            transition: transform .3s cubic-bezier(.2,.7,.3,1);
+        }
+        .sp-sidebar::before {
+            content: '';
+            position: absolute; inset: 0;
+            pointer-events: none;
+            background-image:
+                repeating-linear-gradient(92deg,
+                    transparent 0px, transparent 22px,
+                    rgba(232, 176, 90, .04) 22px, rgba(232, 176, 90, .04) 24px),
+                repeating-linear-gradient(88deg,
+                    transparent 0px, transparent 34px,
+                    rgba(232, 176, 90, .03) 34px, rgba(232, 176, 90, .03) 37px);
+        }
+        .sp-sidebar > * { position: relative; z-index: 1; }
+
+        .sp-sidebar-brand {
+            position: relative;
+            display: flex; align-items: center; justify-content: center;
+            padding: 26px 20px 22px;
+            text-decoration: none; color: inherit;
+            border-bottom: 1px solid rgba(232, 176, 90, .15);
+            flex-shrink: 0; text-align: center;
+        }
+        .sp-sidebar-brand::after {
+            content: '';
+            position: absolute;
+            bottom: -1px; left: 50%;
+            transform: translateX(-50%);
+            width: 60px; height: 2px;
+            background: linear-gradient(90deg, transparent, var(--gold-3), transparent);
+            border-radius: 2px;
+            opacity: .7;
+        }
+        .sp-sidebar-brand-name {
+            font-family: 'Fraunces', Georgia, serif;
+            font-size: 1.4rem; font-weight: 700;
+            letter-spacing: -.5px; margin: 0; line-height: 1;
+            color: #fff;
+        }
+        .sp-sidebar-brand-name span { color: var(--gold-3); transition: color .25s ease; }
+        .sp-sidebar-brand:hover .sp-sidebar-brand-name span { color: var(--gold-4); }
+
+        .sp-sidebar-user {
+            padding: 22px 22px 12px;
+            border-bottom: 1px solid rgba(232, 176, 90, .12);
+            display: flex; align-items: center; justify-content: center;
+            flex-shrink: 0;
+            position: relative;
+        }
+        .sp-sidebar-user::before {
+            content: '';
+            position: absolute;
+            width: 140px; height: 140px;
+            border-radius: 50%;
+            background: radial-gradient(circle, rgba(232, 176, 90, .28), transparent 65%);
+            pointer-events: none;
+        }
+        .sp-user-avatar {
+            position: relative;
+            width: 82px; height: 82px;
+            border-radius: 50%;
+            flex-shrink: 0;
+            padding: 3px;
+            background: linear-gradient(135deg, #F4C87A 0%, #C97628 55%, #8A5A30 100%);
+            box-shadow:
+                0 0 0 1px rgba(74, 44, 16, .35),
+                0 10px 24px -8px rgba(0, 0, 0, .8),
+                0 4px 10px -3px rgba(0, 0, 0, .5);
+            transition: transform .3s ease, box-shadow .3s ease;
+        }
+        .sp-user-avatar:hover {
+            transform: translateY(-3px) scale(1.03);
+            box-shadow:
+                0 0 0 1px rgba(74, 44, 16, .4),
+                0 16px 30px -8px rgba(0, 0, 0, .85),
+                0 6px 14px -3px rgba(0, 0, 0, .55);
+        }
+        .sp-user-avatar::after {
+            content: '';
+            position: absolute;
+            inset: -6px;
+            border-radius: 50%;
+            border: 1px solid rgba(232, 176, 90, .35);
+            animation: spAvatarPulse 3s ease-in-out infinite;
+            pointer-events: none;
+        }
+        @keyframes spAvatarPulse {
+            0%, 100% { transform: scale(1); opacity: .6; }
+            50%      { transform: scale(1.08); opacity: 0; }
+        }
+        .sp-user-avatar-img {
+            width: 100%; height: 100%;
+            border-radius: 50%; overflow: hidden;
+            background: #FDFAF1;
+            display: grid; place-items: center;
+        }
+        .sp-user-avatar-img img {
+            width: 100%; height: 100%;
+            object-fit: cover; object-position: center;
+            display: block; border-radius: 50%;
+        }
+
+        /* Role chip under avatar */
+        .sp-sidebar-role {
+            display: flex; align-items: center; justify-content: center;
+            padding: 0 22px 18px;
+            margin-top: -4px;
+            border-bottom: 1px solid rgba(232, 176, 90, .12);
+            flex-shrink: 0;
+        }
+        .sp-sidebar-role-chip {
+            display: inline-flex; align-items: center; gap: 6px;
+            padding: 5px 12px;
+            border-radius: 999px;
+            background: rgba(232, 176, 90, .14);
+            border: 1px solid rgba(232, 176, 90, .32);
+            color: var(--gold-3);
+            font-size: .64rem; font-weight: 700;
+            letter-spacing: 1.1px; text-transform: uppercase;
+            white-space: nowrap;
+        }
+        .sp-sidebar-role-chip i { font-size: .78rem; }
+
+        .sp-nav {
+            padding: 16px 12px;
+            display: flex; flex-direction: column; gap: 3px;
+            flex: 1 1 auto; min-height: 0;
+            overflow-y: auto; overflow-x: hidden;
+            overscroll-behavior: contain;
+            -webkit-overflow-scrolling: touch;
+            scrollbar-width: thin;
+            scrollbar-color: rgba(232, 176, 90, .35) transparent;
+        }
+        .sp-nav::-webkit-scrollbar { width: 6px; }
+        .sp-nav::-webkit-scrollbar-track { background: transparent; margin: 6px 0; }
+        .sp-nav::-webkit-scrollbar-thumb {
+            background: linear-gradient(180deg, rgba(232, 176, 90, .45), rgba(176, 100, 30, .35));
+            border-radius: 4px; border: 1.5px solid transparent;
+            background-clip: content-box;
+        }
+        .sp-nav::-webkit-scrollbar-thumb:hover {
+            background: linear-gradient(180deg, rgba(232, 176, 90, .7), rgba(176, 100, 30, .6));
+            background-clip: content-box;
+        }
+        .sp-nav-label {
+            padding: 12px 12px 6px;
+            font-size: .64rem; font-weight: 700;
+            letter-spacing: 1.4px; text-transform: uppercase;
+            color: rgba(255, 255, 255, .42);
+        }
+        .sp-nav-link {
+            display: flex; align-items: center; gap: 12px;
+            padding: 11px 14px; border-radius: 10px;
+            color: rgba(255, 255, 255, .82);
+            text-decoration: none;
+            font-size: .87rem; font-weight: 500;
+            transition: background .18s ease, color .18s ease, transform .18s ease;
+            position: relative; flex-shrink: 0;
+        }
+        .sp-nav-link i {
+            font-size: 1.05rem; width: 20px; text-align: center;
+            color: rgba(255, 255, 255, .58);
+            transition: color .18s ease;
+        }
+        .sp-nav-link:hover {
+            background: rgba(232, 176, 90, .12);
+            color: #fff; transform: translateX(2px);
+        }
+        .sp-nav-link:hover i { color: var(--gold-3); }
+
+        /* Hover dot */
+        .sp-nav-link::after {
+            content: '';
+            position: absolute;
+            right: 14px; top: 50%;
+            transform: translateY(-50%) translateX(6px);
+            width: 5px; height: 5px;
+            border-radius: 50%;
+            background: var(--gold-3);
+            opacity: 0;
+            transition: opacity .2s ease, transform .2s ease;
+        }
+        .sp-nav-link:hover::after { opacity: .9; transform: translateY(-50%) translateX(0); }
+
+        .sp-nav-link.is-active {
+            background: linear-gradient(135deg, rgba(232, 176, 90, .28), rgba(176, 100, 30, .18));
+            color: #fff; font-weight: 600;
+            box-shadow: inset 0 0 0 1px rgba(232, 176, 90, .3);
+            animation: spNavGlow 4s ease-in-out infinite;
+        }
+        @keyframes spNavGlow {
+            0%, 100% { box-shadow: inset 0 0 0 1px rgba(232, 176, 90, .3); }
+            50%      { box-shadow: inset 0 0 0 1px rgba(232, 176, 90, .5), 0 0 18px -6px rgba(232, 176, 90, .4); }
+        }
+        .sp-nav-link.is-active i { color: var(--gold-3); }
+        .sp-nav-link.is-active::before {
+            content: ''; position: absolute; left: 0;
+            top: 22%; bottom: 22%; width: 3px;
+            border-radius: 0 3px 3px 0;
+            background: var(--gold-3);
+        }
+        .sp-nav-link.is-active::after { display: none; }
+
+        .sp-sidebar-foot {
+            padding: 14px 12px 18px;
+            border-top: 1px solid rgba(232, 176, 90, .12);
+            flex-shrink: 0;
+        }
+        .sp-nav-link.sp-logout { color: rgba(255, 200, 180, .92); }
+        .sp-nav-link.sp-logout:hover {
+            background: rgba(162, 58, 26, .25); color: #fff;
+        }
+        .sp-nav-link.sp-logout:hover i {
+            color: #FFB199;
+            transform: translateX(2px);
+            transition: transform .2s ease;
+        }
+        .sp-sidebar-tag {
+            padding: 10px 22px 0;
+            text-align: center;
+            font-size: .62rem;
+            color: rgba(255, 255, 255, .32);
+            font-weight: 500;
+            letter-spacing: .4px;
+        }
+
+        /* ============================================================
+           MAIN
+           ============================================================ */
+        .sp-main {
+            flex: 1; min-width: 0;
+            margin-left: var(--sidebar-w);
+            display: flex; flex-direction: column;
+        }
+
+        .sp-topbar {
+            position: sticky; top: 0; z-index: 100;
+            display: flex; align-items: center; justify-content: space-between;
+            gap: 16px;
+            padding: 14px clamp(20px, 3vw, 38px);
+            background: rgba(253, 250, 241, .88);
+            backdrop-filter: blur(16px) saturate(150%);
+            -webkit-backdrop-filter: blur(16px) saturate(150%);
+            border-bottom: 1px solid var(--line);
+        }
+        .sp-topbar-left { display: flex; align-items: center; gap: 14px; min-width: 0; }
+        .sp-menu-btn {
+            display: none;
+            width: 40px; height: 40px;
+            border: 1.5px solid var(--line-2);
+            background: #fff; border-radius: 10px;
+            color: var(--brown-2); font-size: 1.1rem;
+            cursor: pointer;
+            align-items: center; justify-content: center;
+            transition: border-color .18s ease, color .18s ease;
+        }
+        .sp-menu-btn:hover { border-color: var(--gold); color: var(--gold); }
+        .sp-page-title {
+            font-family: 'Fraunces', Georgia, serif;
+            font-size: clamp(1.15rem, 1.9vw, 1.4rem);
+            font-weight: 700; letter-spacing: -.4px;
+            color: var(--brown); margin: 0; line-height: 1.2;
+        }
+        .sp-page-sub {
+            display: block; font-size: .74rem; font-weight: 500;
+            color: var(--text-3); margin-top: 2px; letter-spacing: .2px;
+        }
+        .sp-page-sub strong { color: var(--gold); font-weight: 700; }
+
+        .sp-topbar-right { display: flex; align-items: center; gap: 10px; }
+        .sp-icon-btn {
+            position: relative;
+            width: 40px; height: 40px;
+            border: 1.5px solid var(--line-2);
+            background: #fff; border-radius: 10px;
+            color: var(--brown-2); font-size: 1rem;
+            cursor: pointer;
+            display: inline-flex; align-items: center; justify-content: center;
+            transition: border-color .18s ease, color .18s ease, transform .18s ease;
+        }
+        .sp-icon-btn:hover {
+            border-color: var(--gold); color: var(--gold);
+            transform: translateY(-1px);
+        }
+        .sp-icon-btn .badge-dot {
+            position: absolute; top: 8px; right: 9px;
+            width: 8px; height: 8px; border-radius: 50%;
+            background: var(--danger);
+            box-shadow: 0 0 0 2px #fff;
+        }
+        .sp-cta {
+            display: inline-flex; align-items: center; gap: 8px;
+            padding: 10px 18px; border-radius: 10px;
+            background: linear-gradient(135deg, var(--gold), var(--gold-2));
+            color: #fff; font-weight: 700; font-size: .85rem;
+            text-decoration: none;
+            border: 0; cursor: pointer; font-family: inherit;
+            box-shadow: 0 3px 0 rgba(0,0,0,.12), 0 12px 24px -12px rgba(176,100,30,.7);
+            transition: transform .15s ease, filter .15s ease, box-shadow .15s ease;
+        }
+        .sp-cta:hover {
+            color: #fff; transform: translateY(-1px);
+            filter: brightness(1.04);
+            box-shadow: 0 5px 0 rgba(0,0,0,.12), 0 16px 30px -12px rgba(176,100,30,.8);
+        }
+        .sp-cta i { font-size: 1rem; }
+
+        .sp-content {
+            padding: clamp(20px, 3vw, 38px);
+            display: flex; flex-direction: column;
+            gap: clamp(18px, 2.4vh, 26px);
+        }
+
+        /* ============================================================
+           PAGE INTRO
+           ============================================================ */
+        .sp-intro {
+            position: relative; overflow: hidden;
+            padding: clamp(24px, 3.2vh, 34px) clamp(22px, 3vw, 36px);
+            border-radius: 22px;
+            background:
+                radial-gradient(circle at 82% 18%, rgba(232, 176, 90, .32), transparent 55%),
+                radial-gradient(circle at 10% 90%, rgba(184, 92, 46, .18), transparent 50%),
+                linear-gradient(135deg, #4A2C10 0%, #2A1E10 100%);
+            color: #fff;
+            display: flex; align-items: center; justify-content: space-between;
+            gap: 24px;
+            box-shadow: 0 24px 60px -28px rgba(40, 22, 6, .7);
+        }
+        .sp-intro::before {
+            content: ''; position: absolute; inset: 0;
+            pointer-events: none;
+            background-image:
+                repeating-linear-gradient(92deg,
+                    transparent 0px, transparent 22px,
+                    rgba(232, 176, 90, .06) 22px, rgba(232, 176, 90, .06) 24px),
+                repeating-linear-gradient(88deg,
+                    transparent 0px, transparent 34px,
+                    rgba(232, 176, 90, .04) 34px, rgba(232, 176, 90, .04) 37px);
+        }
+        .sp-intro > * { position: relative; z-index: 1; }
+        .sp-intro-text { min-width: 0; }
+
+        .sp-intro-tag {
+            display: inline-flex; align-items: center; gap: 7px;
+            padding: 5px 12px; border-radius: 999px;
+            background: rgba(232, 176, 90, .16);
+            border: 1px solid rgba(232, 176, 90, .35);
+            font-size: .66rem; font-weight: 700;
+            letter-spacing: 1.3px; text-transform: uppercase;
+            color: var(--gold-3); margin-bottom: 14px;
+        }
+        .sp-intro h2 {
+            font-family: 'Fraunces', Georgia, serif;
+            font-size: clamp(1.5rem, 2.4vw, 2rem);
+            font-weight: 600; line-height: 1.15;
+            letter-spacing: -.5px; margin: 0 0 10px;
+        }
+        .sp-intro h2 em { font-style: italic; color: var(--gold-3); font-weight: 500; }
+        .sp-intro p {
+            font-size: .9rem; color: rgba(255, 255, 255, .76);
+            line-height: 1.6; margin: 0; max-width: 54ch;
+        }
+        .sp-intro-actions {
+            display: flex; flex-wrap: wrap; gap: 10px;
+            margin-top: 18px;
+        }
+        .sp-intro-btn {
+            display: inline-flex; align-items: center; gap: 8px;
+            padding: 10px 18px; border-radius: 10px;
+            font-size: .84rem; font-weight: 700;
+            text-decoration: none;
+            border: 0; cursor: pointer; font-family: inherit;
+            transition: transform .15s ease, filter .15s ease;
+        }
+        .sp-intro-btn.is-primary {
+            background: linear-gradient(135deg, var(--gold), var(--gold-2));
+            color: #fff;
+            box-shadow: 0 3px 0 rgba(0,0,0,.18), 0 14px 26px -12px rgba(176,100,30,.85);
+        }
+        .sp-intro-btn.is-primary:hover { color: #fff; transform: translateY(-2px); filter: brightness(1.06); }
+        .sp-intro-btn.is-ghost {
+            background: rgba(255, 255, 255, .08);
+            color: rgba(255, 255, 255, .92);
+            border: 1px solid rgba(255, 255, 255, .2);
+            text-decoration: none;
+        }
+        .sp-intro-btn.is-ghost:hover { background: rgba(255, 255, 255, .16); color: #fff; transform: translateY(-2px); }
+
+        .sp-intro-mini {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 10px;
+            flex-shrink: 0;
+        }
+        .sp-intro-mini-card {
+            background: rgba(255, 255, 255, .08);
+            border: 1px solid rgba(232, 176, 90, .25);
+            border-radius: 14px;
+            padding: 12px 14px;
+            min-width: 120px;
+        }
+        .sp-intro-mini-label {
+            font-size: .62rem; font-weight: 700;
+            letter-spacing: 1.1px; text-transform: uppercase;
+            color: rgba(255, 255, 255, .55);
+            margin-bottom: 5px;
+        }
+        .sp-intro-mini-value {
+            font-family: 'Fraunces', Georgia, serif;
+            font-size: 1.05rem; font-weight: 700;
+            letter-spacing: -.3px;
+            color: #fff; line-height: 1.1;
+        }
+        .sp-intro-mini-value small {
+            font-size: .68rem; font-weight: 600;
+            color: rgba(255, 255, 255, .6);
+            margin-left: 3px;
+        }
+        @media (max-width: 1080px) { .sp-intro-mini { display: none; } }
+
+        /* ============================================================
+           FILTER TOOLBAR
+           ============================================================ */
+        .sp-toolbar {
+            background: #fff;
+            border: 1px solid var(--line);
+            border-radius: 18px;
+            box-shadow: 0 1px 0 rgba(255,255,255,.9) inset,
+                        0 14px 30px -22px rgba(74, 44, 16, .4);
+            padding: 16px 18px;
+            display: flex; flex-direction: column;
+            gap: 14px;
+        }
+        .sp-status-tabs {
+            display: flex; flex-wrap: wrap; gap: 6px;
+        }
+        .sp-status-tab {
+            display: inline-flex; align-items: center; gap: 7px;
+            padding: 8px 14px; border-radius: 10px;
+            background: var(--cream-2);
+            border: 1.5px solid var(--line);
+            color: var(--text-2);
+            font-size: .8rem; font-weight: 600;
+            text-decoration: none;
+            transition: border-color .18s ease, background .18s ease, color .18s ease, transform .18s ease;
+        }
+        .sp-status-tab:hover {
+            border-color: var(--line-3);
+            color: var(--brown);
+            transform: translateY(-1px);
+        }
+        .sp-status-tab.is-active {
+            background: linear-gradient(135deg, var(--gold-soft), #fff);
+            border-color: rgba(176, 100, 30, .4);
+            color: var(--gold);
+            font-weight: 700;
+            box-shadow: 0 4px 12px -6px rgba(176, 100, 30, .4);
+        }
+        .sp-status-tab .count {
+            padding: 1px 8px;
+            border-radius: 999px;
+            background: var(--paper-2);
+            color: var(--text-2);
+            font-size: .68rem; font-weight: 700;
+            font-family: 'JetBrains Mono', monospace;
+        }
+        .sp-status-tab.is-active .count {
+            background: rgba(176, 100, 30, .15);
+            color: var(--gold);
+        }
+
+        .sp-filter-row {
+            display: grid;
+            grid-template-columns: minmax(0, 1.5fr) repeat(3, minmax(0, 1fr)) auto auto;
+            gap: 10px;
+            align-items: stretch;
+        }
+        @media (max-width: 1080px) {
+            .sp-filter-row { grid-template-columns: 1fr 1fr; }
+        }
+        @media (max-width: 620px) {
+            .sp-filter-row { grid-template-columns: 1fr; }
+        }
+
+        .sp-field {
+            display: flex; align-items: center;
+            background: #fff;
+            border: 1.5px solid var(--line-2);
+            border-radius: 11px;
+            transition: border-color .18s ease, box-shadow .18s ease;
+            overflow: hidden;
+            min-height: 44px;
+        }
+        .sp-field:hover { border-color: var(--line-3); }
+        .sp-field:focus-within {
+            border-color: var(--gold);
+            box-shadow: 0 0 0 4px rgba(176, 100, 30, .12);
+        }
+        .sp-field i {
+            padding: 0 4px 0 13px;
+            color: var(--text-3);
+            font-size: .95rem;
+            transition: color .18s ease;
+        }
+        .sp-field:focus-within i { color: var(--gold); }
+        .sp-field input,
+        .sp-field select {
+            flex: 1; border: 0; outline: 0;
+            background: transparent;
+            padding: 11px 14px 11px 9px;
+            font-size: .87rem; font-weight: 500;
+            color: #2A1E10; font-family: inherit;
+            min-width: 0; width: 100%;
+            -webkit-text-fill-color: #2A1E10;
+        }
+        .sp-field input::placeholder { color: #A9A392; font-weight: 400; }
+        .sp-field select option { color: #2A1E10; background: #fff; }
+        .sp-field.is-select { position: relative; }
+        .sp-field.is-select::after {
+            content: '';
+            width: 7px; height: 7px;
+            border-right: 2px solid var(--text-3);
+            border-bottom: 2px solid var(--text-3);
+            transform: rotate(45deg) translate(-6px, -3px);
+            pointer-events: none; margin-right: 14px;
+        }
+        .sp-field.is-select select { appearance: none; -webkit-appearance: none; cursor: pointer; }
+
+        .sp-btn-primary,
+        .sp-btn-ghost {
+            display: inline-flex; align-items: center; justify-content: center;
+            gap: 8px;
+            padding: 11px 18px; border-radius: 11px;
+            font-size: .85rem; font-weight: 700;
+            font-family: inherit; cursor: pointer;
+            white-space: nowrap;
+            transition: transform .15s ease, filter .15s ease, border-color .18s ease, color .18s ease;
+            min-height: 44px;
+        }
+        .sp-btn-primary {
+            border: 0;
+            background: linear-gradient(135deg, var(--gold), var(--gold-2));
+            color: #fff;
+            box-shadow: 0 3px 0 rgba(0,0,0,.12), 0 14px 24px -12px rgba(176,100,30,.75);
+        }
+        .sp-btn-primary:hover { transform: translateY(-1px); filter: brightness(1.04); }
+        .sp-btn-ghost {
+            border: 1.5px solid var(--line-2);
+            background: #fff;
+            color: var(--brown-2);
+            text-decoration: none;
+        }
+        .sp-btn-ghost:hover {
+            border-color: var(--gold); color: var(--gold);
+            transform: translateY(-1px);
+        }
+
+        /* ============================================================
+           SUMMARY STRIP
+           ============================================================ */
+        .sp-summary-strip {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 12px;
+        }
+        .sp-summary-card {
+            background: #fff;
+            border: 1px solid var(--line);
+            border-radius: 14px;
+            padding: 14px 16px;
+            display: flex; align-items: center; gap: 12px;
+            box-shadow: 0 1px 0 rgba(255,255,255,.9) inset,
+                        0 10px 22px -18px rgba(74, 44, 16, .4);
+            transition: transform .22s ease, border-color .22s ease;
+        }
+        .sp-summary-card:hover {
+            transform: translateY(-3px);
+            border-color: rgba(176, 100, 30, .3);
+        }
+        .sp-summary-ico {
+            width: 40px; height: 40px;
+            border-radius: 11px;
+            display: grid; place-items: center;
+            background: var(--gold-soft);
+            color: var(--gold);
+            font-size: 1.05rem;
+            border: 1px solid rgba(176, 100, 30, .18);
+            flex-shrink: 0;
+        }
+        .sp-summary-ico.is-info    { background: var(--info-bg);    color: var(--info);    border-color: #C6DCF0; }
+        .sp-summary-ico.is-success { background: var(--success-bg); color: var(--success); border-color: var(--success-bd); }
+        .sp-summary-ico.is-warn    { background: var(--warn-bg);    color: var(--warn);    border-color: var(--warn-bd); }
+        .sp-summary-body { min-width: 0; }
+        .sp-summary-label {
+            font-size: .62rem; font-weight: 700;
+            letter-spacing: 1.1px; text-transform: uppercase;
+            color: var(--text-3); margin-bottom: 3px;
+        }
+        .sp-summary-value {
+            font-family: 'Fraunces', Georgia, serif;
+            font-size: 1.1rem; font-weight: 700;
+            color: var(--brown); letter-spacing: -.3px;
+            line-height: 1.15;
+        }
+        .sp-summary-value small {
+            font-size: .7rem; font-weight: 600;
+            color: var(--text-3); margin-left: 3px;
+        }
+
+        /* ============================================================
+           PANEL / TABLE
+           ============================================================ */
+        .sp-panel {
+            position: relative;
+            background: #fff;
+            border: 1px solid var(--line);
+            border-radius: 18px;
+            overflow: hidden;
+            box-shadow: 0 1px 0 rgba(255,255,255,.9) inset,
+                        0 14px 30px -22px rgba(74, 44, 16, .4);
+            transition: box-shadow .28s ease, border-color .28s ease;
+        }
+        .sp-panel:hover {
+            border-color: rgba(176, 100, 30, .24);
+            box-shadow: 0 1px 0 rgba(255,255,255,.9) inset,
+                        0 24px 46px -22px rgba(74, 44, 16, .5);
+        }
+        .sp-panel::before {
+            content: '';
+            position: absolute;
+            top: 0; left: 0;
+            width: 56px; height: 3px;
+            background: linear-gradient(90deg, var(--gold), var(--gold-3));
+            border-radius: 0 3px 3px 0;
+            opacity: .55;
+            transition: opacity .25s ease, width .3s ease;
+        }
+        .sp-panel:hover::before { opacity: 1; width: 84px; }
+
+        .sp-panel-head {
+            display: flex; align-items: center; justify-content: space-between;
+            gap: 12px;
+            padding: 18px 22px;
+            border-bottom: 1px solid var(--line);
+            background: linear-gradient(180deg, #fff, var(--cream-2));
+            flex-wrap: wrap;
+        }
+        .sp-panel-title {
+            display: flex; align-items: center; gap: 11px;
+            font-family: 'Fraunces', Georgia, serif;
+            font-size: 1.06rem; font-weight: 600;
+            color: var(--brown); margin: 0;
+        }
+        .sp-panel-title i {
+            width: 32px; height: 32px;
+            border-radius: 10px;
+            display: grid; place-items: center;
+            background: var(--gold-soft);
+            color: var(--gold);
+            font-size: .95rem;
+            border: 1px solid rgba(176, 100, 30, .18);
+        }
+        .sp-panel-meta {
+            font-size: .74rem; color: var(--text-3);
+            font-weight: 500;
+        }
+        .sp-panel-meta strong { color: var(--brown); font-weight: 700; }
+
+        .sp-table-wrap { overflow-x: auto; }
+        .sp-table {
+            width: 100%; border-collapse: collapse;
+            font-size: .86rem;
+        }
+        .sp-table thead th {
+            text-align: left; padding: 12px 18px;
+            font-size: .64rem; font-weight: 700;
+            letter-spacing: 1.1px; text-transform: uppercase;
+            color: var(--text-3);
+            border-bottom: 1px solid var(--line);
+            white-space: nowrap;
+            background: var(--cream-2);
+            position: sticky; top: 0; z-index: 2;
+        }
+        .sp-table thead th a {
+            color: inherit; text-decoration: none;
+            display: inline-flex; align-items: center; gap: 4px;
+            transition: color .15s ease;
+        }
+        .sp-table thead th a:hover { color: var(--gold); }
+        .sp-table thead th a i { font-size: .7rem; opacity: .5; }
+        .sp-table thead th a.is-sorted i { opacity: 1; color: var(--gold); }
+
+        .sp-table tbody td {
+            padding: 14px 18px;
+            border-bottom: 1px dashed var(--line-2);
+            color: var(--text);
+            vertical-align: middle;
+            white-space: nowrap;
+        }
+        .sp-table tbody tr:last-child td { border-bottom: 0; }
+        .sp-table tbody tr {
+            transition: background .18s ease;
+            cursor: pointer;
+        }
+        .sp-table tbody tr:hover { background: var(--gold-soft); }
+
+        .sp-ref {
+            font-family: 'JetBrains Mono', ui-monospace, monospace;
+            font-size: .78rem; font-weight: 600;
+            color: var(--brown-2);
+            background: var(--paper-2);
+            border: 1px solid var(--line-2);
+            padding: 3px 8px; border-radius: 5px;
+        }
+        .sp-seller {
+            display: flex; align-items: center; gap: 10px;
+        }
+        .sp-seller-avatar {
+            width: 32px; height: 32px;
+            border-radius: 50%;
+            background: linear-gradient(135deg, var(--gold), var(--gold-2));
+            color: #fff;
+            display: grid; place-items: center;
+            font-family: 'Fraunces', Georgia, serif;
+            font-weight: 700; font-size: .82rem;
+            flex-shrink: 0;
+            box-shadow: 0 4px 10px -4px rgba(176,100,30,.7);
+        }
+        .sp-seller-name {
+            font-weight: 600; color: var(--brown);
+            max-width: 18ch;
+            overflow: hidden; text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .sp-badge {
+            display: inline-flex; align-items: center; gap: 5px;
+            padding: 4px 10px; border-radius: 999px;
+            font-size: .68rem; font-weight: 700;
+            letter-spacing: .3px; text-transform: uppercase;
+        }
+        .sp-badge i { font-size: .78rem; }
+        .sp-badge-paid    { background: var(--success-bg); color: var(--success); border: 1px solid var(--success-bd); }
+        .sp-badge-partial { background: var(--warn-bg);    color: var(--warn);    border: 1px solid var(--warn-bd); }
+        .sp-badge-unpaid  { background: var(--danger-bg);  color: var(--danger);  border: 1px solid var(--danger-bd); }
+        .sp-badge-pending { background: var(--info-bg);    color: var(--info);    border: 1px solid #C6DCF0; }
+
+        .sp-money {
+            font-family: 'Fraunces', Georgia, serif;
+            font-weight: 700; color: var(--brown);
+            letter-spacing: -.2px;
+        }
+        .sp-money.is-muted { color: var(--text-3); }
+        .sp-money.is-danger { color: var(--danger); }
+        .sp-money.is-success { color: var(--success); }
+
+        .sp-row-actions {
+            display: inline-flex; align-items: center; gap: 4px;
+        }
+        .sp-row-btn {
+            width: 30px; height: 30px;
+            border-radius: 8px;
+            border: 1px solid transparent;
+            background: transparent;
+            color: var(--text-3);
+            font-size: .88rem;
+            cursor: pointer;
+            display: inline-grid; place-items: center;
+            transition: background .15s ease, color .15s ease, border-color .15s ease;
+        }
+        .sp-row-btn:hover {
+            background: #fff;
+            border-color: var(--line-2);
+            color: var(--gold);
+        }
+        .sp-row-btn.is-danger:hover {
+            color: var(--danger);
+            border-color: var(--danger-bd);
+            background: var(--danger-bg);
+        }
+
+        /* Empty state */
+        .sp-empty { padding: 56px 26px; text-align: center; color: var(--text-3); }
+        .sp-empty-ico {
+            width: 76px; height: 76px;
+            margin: 0 auto 18px;
+            border-radius: 50%;
+            display: grid; place-items: center;
+            background: linear-gradient(135deg, var(--gold-soft), #fff);
+            color: var(--gold);
+            font-size: 1.9rem;
+            border: 1px solid rgba(176, 100, 30, .2);
+            box-shadow: 0 10px 24px -12px rgba(176, 100, 30, .4);
+        }
+        .sp-empty h4 {
+            font-family: 'Fraunces', Georgia, serif;
+            font-size: 1.15rem; font-weight: 600;
+            color: var(--brown); margin: 0 0 8px;
+        }
+        .sp-empty p {
+            font-size: .88rem; margin: 0 0 20px;
+            max-width: 42ch; margin-inline: auto; line-height: 1.6;
+        }
+        .sp-empty-actions {
+            display: inline-flex; gap: 10px; flex-wrap: wrap;
+            justify-content: center;
+        }
+
+        /* Pagination */
+        .sp-pagination {
+            display: flex; align-items: center; justify-content: space-between;
+            gap: 12px; flex-wrap: wrap;
+            padding: 14px 18px;
+            border-top: 1px solid var(--line);
+            background: var(--cream-2);
+        }
+        .sp-pagination-info {
+            font-size: .78rem; color: var(--text-3); font-weight: 500;
+        }
+        .sp-pagination-info strong { color: var(--brown); font-weight: 700; }
+        .sp-pagination-list {
+            display: inline-flex; align-items: center; gap: 4px;
+        }
+        .sp-page-link {
+            min-width: 36px; height: 36px;
+            padding: 0 10px;
+            border-radius: 9px;
+            border: 1.5px solid var(--line-2);
+            background: #fff;
+            color: var(--brown-2);
+            font-size: .82rem; font-weight: 600;
+            display: inline-grid; place-items: center;
+            text-decoration: none;
+            cursor: pointer;
+            transition: border-color .15s ease, color .15s ease, transform .15s ease, background .15s ease;
+        }
+        .sp-page-link:hover {
+            border-color: var(--gold); color: var(--gold);
+            transform: translateY(-1px);
+        }
+        .sp-page-link.is-active {
+            background: linear-gradient(135deg, var(--gold), var(--gold-2));
+            border-color: transparent; color: #fff;
+            box-shadow: 0 6px 14px -6px rgba(176,100,30,.7);
+        }
+        .sp-page-link.is-disabled {
+            opacity: .45; pointer-events: none;
+        }
+        .sp-page-dots {
+            padding: 0 4px;
+            color: var(--text-3);
+            font-weight: 700;
+        }
+
+        /* ============================================================
+           MODALS
+           ============================================================ */
+        .sp-modal-backdrop {
+            position: fixed; inset: 0;
+            background: rgba(42, 30, 16, .6);
+            backdrop-filter: blur(8px);
+            -webkit-backdrop-filter: blur(8px);
+            z-index: 400;
+            display: none;
+            align-items: center; justify-content: center;
+            padding: 20px;
+            opacity: 0;
+            transition: opacity .25s ease;
+            overflow: hidden;
+        }
+        .sp-modal-backdrop.is-open { display: flex; opacity: 1; }
+        .sp-modal {
+            background: #fff;
+            border-radius: 22px;
+            width: 100%;
+            max-width: 620px;
+            max-height: calc(100vh - 40px);
+            display: flex; flex-direction: column;
+            overflow: hidden;
+            box-shadow: 0 46px 100px -34px rgba(40, 22, 6, .8);
+            transform: scale(.95) translateY(10px);
+            transition: transform .3s cubic-bezier(.2,.7,.3,1);
+            min-height: 0;
+        }
+        .sp-modal.is-wide { max-width: 760px; }
+        .sp-modal-backdrop.is-open .sp-modal { transform: scale(1) translateY(0); }
+
+        .sp-modal-head {
+            position: relative;
+            padding: 24px 26px 20px;
+            background:
+                radial-gradient(circle at 85% 15%, rgba(232, 176, 90, .35), transparent 55%),
+                linear-gradient(135deg, #4A2C10 0%, #2A1E10 100%);
+            color: #fff;
+            flex-shrink: 0; overflow: hidden;
+        }
+        .sp-modal-head::before {
+            content: ''; position: absolute; inset: 0;
+            background-image:
+                repeating-linear-gradient(92deg,
+                    transparent 0px, transparent 22px,
+                    rgba(232, 176, 90, .06) 22px, rgba(232, 176, 90, .06) 24px),
+                repeating-linear-gradient(88deg,
+                    transparent 0px, transparent 34px,
+                    rgba(232, 176, 90, .04) 34px, rgba(232, 176, 90, .04) 37px);
+            pointer-events: none;
+        }
+        .sp-modal-head > * { position: relative; z-index: 1; }
+        .sp-modal-close {
+            position: absolute;
+            top: 18px; right: 18px;
+            width: 36px; height: 36px;
+            border-radius: 10px;
+            border: 1px solid rgba(255, 255, 255, .2);
+            background: rgba(255, 255, 255, .1);
+            color: #fff;
+            cursor: pointer;
+            display: inline-flex; align-items: center; justify-content: center;
+            font-size: 1rem;
+            transition: background .18s ease, transform .25s ease;
+        }
+        .sp-modal-close:hover {
+            background: rgba(255, 255, 255, .22);
+            transform: rotate(90deg);
+        }
+        .sp-modal-tag {
+            display: inline-flex; align-items: center; gap: 6px;
+            padding: 4px 11px;
+            border-radius: 999px;
+            background: rgba(232, 176, 90, .15);
+            border: 1px solid rgba(232, 176, 90, .3);
+            font-size: .62rem; font-weight: 700;
+            letter-spacing: 1.2px; text-transform: uppercase;
+            color: var(--gold-3);
+            margin-bottom: 12px;
+        }
+        .sp-modal-title {
+            font-family: 'Fraunces', Georgia, serif;
+            font-size: 1.45rem; font-weight: 600;
+            letter-spacing: -.45px;
+            margin: 0 0 4px;
+            line-height: 1.2;
+        }
+        .sp-modal-sub {
+            margin: 0;
+            font-size: .85rem;
+            color: rgba(255, 255, 255, .72);
+            line-height: 1.55;
+        }
+        .sp-modal-body {
+            padding: 24px 26px;
+            overflow-y: auto;
+            overflow-x: hidden;
+            flex: 1 1 auto;
+            min-height: 0;
+            display: flex; flex-direction: column;
+            gap: 16px;
+            overscroll-behavior: contain;
+            -webkit-overflow-scrolling: touch;
+            scrollbar-width: thin;
+            scrollbar-color: var(--line-3) transparent;
+        }
+        .sp-modal-body::-webkit-scrollbar { width: 8px; }
+        .sp-modal-body::-webkit-scrollbar-track { background: transparent; margin: 12px 0; }
+        .sp-modal-body::-webkit-scrollbar-thumb {
+            background: linear-gradient(180deg, var(--line-2), var(--line-3));
+            border-radius: 4px;
+            border: 2px solid transparent;
+            background-clip: content-box;
+        }
+        .sp-modal-foot {
+            padding: 16px 26px 22px;
+            border-top: 1px solid var(--line);
+            background: var(--cream-2);
+            display: flex; align-items: center; justify-content: flex-end;
+            gap: 10px;
+            flex-shrink: 0;
+            flex-wrap: wrap;
+        }
+        .sp-modal-foot .sp-btn-primary { min-height: 44px; }
+
+        /* Detail view */
+        .sp-detail-hero {
+            display: flex; align-items: center; justify-content: space-between;
+            gap: 14px;
+            padding: 18px 20px;
+            border-radius: 14px;
+            background: linear-gradient(135deg, var(--gold-soft), #fff);
+            border: 1px solid rgba(176, 100, 30, .22);
+            flex-wrap: wrap;
+        }
+        .sp-detail-hero-label {
+            font-size: .64rem; font-weight: 700;
+            letter-spacing: 1.1px; text-transform: uppercase;
+            color: var(--text-3); margin-bottom: 4px;
+        }
+        .sp-detail-hero-value {
+            font-family: 'Fraunces', Georgia, serif;
+            font-size: 1.5rem; font-weight: 700;
+            color: var(--brown); letter-spacing: -.5px;
+            line-height: 1.1;
+        }
+        .sp-detail-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 12px;
+        }
+        @media (max-width: 520px) { .sp-detail-grid { grid-template-columns: 1fr; } }
+        .sp-detail-item {
+            padding: 12px 14px;
+            border-radius: 12px;
+            background: var(--cream-2);
+            border: 1px solid var(--line);
+        }
+        .sp-detail-item.is-full { grid-column: 1 / -1; }
+        .sp-detail-label {
+            font-size: .62rem; font-weight: 700;
+            letter-spacing: 1.1px; text-transform: uppercase;
+            color: var(--text-3); margin-bottom: 4px;
+        }
+        .sp-detail-value {
+            font-size: .92rem; font-weight: 600;
+            color: var(--brown); line-height: 1.4;
+            word-break: break-word;
+        }
+        .sp-detail-value.is-mono {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: .84rem;
+        }
+        .sp-detail-value.is-muted { color: var(--text-3); font-weight: 500; }
+
+        .sp-form-row {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 14px;
+        }
+        @media (max-width: 540px) { .sp-form-row { grid-template-columns: 1fr; } }
+        .sp-form-field { display: flex; flex-direction: column; gap: 6px; }
+        .sp-form-field.is-full { grid-column: 1 / -1; }
+        .sp-form-field label {
+            font-size: .66rem; font-weight: 700;
+            letter-spacing: 1.1px; text-transform: uppercase;
+            color: var(--brown-2);
+        }
+        .sp-form-field label .req { color: var(--danger); margin-left: 2px; }
+        .sp-form-input {
+            display: flex; align-items: center;
+            background: #fff;
+            border: 1.5px solid var(--line-2);
+            border-radius: 11px;
+            transition: border-color .18s ease, box-shadow .18s ease;
+            overflow: hidden;
+            min-height: 46px;
+        }
+        .sp-form-input:hover { border-color: var(--line-3); }
+        .sp-form-input:focus-within {
+            border-color: var(--gold);
+            box-shadow: 0 0 0 4px rgba(176, 100, 30, .13);
+        }
+        .sp-form-input i {
+            padding: 0 4px 0 14px;
+            color: var(--text-3);
+            font-size: .95rem;
+        }
+        .sp-form-input:focus-within i { color: var(--gold); }
+        .sp-form-input input,
+        .sp-form-input select,
+        .sp-form-input textarea {
+            flex: 1; border: 0; outline: 0;
+            background: transparent;
+            padding: 11px 14px 11px 10px;
+            font-size: .89rem; font-weight: 500;
+            color: #2A1E10; font-family: inherit;
+            min-width: 0; width: 100%;
+            -webkit-text-fill-color: #2A1E10;
+        }
+        .sp-form-input select:focus,
+        .sp-form-input select:active {
+            color: #2A1E10 !important;
+            -webkit-text-fill-color: #2A1E10 !important;
+        }
+        .sp-form-input select option { color: #2A1E10; background: #fff; }
+        .sp-form-input textarea {
+            resize: vertical; min-height: 76px;
+            padding-top: 12px;
+        }
+        .sp-form-input input::placeholder,
+        .sp-form-input textarea::placeholder { color: #A9A392; font-weight: 400; }
+        .sp-form-input.is-select { position: relative; }
+        .sp-form-input.is-select select { appearance: none; -webkit-appearance: none; cursor: pointer; }
+        .sp-form-input.is-select::after {
+            content: '';
+            width: 7px; height: 7px;
+            border-right: 2px solid var(--text-3);
+            border-bottom: 2px solid var(--text-3);
+            transform: rotate(45deg) translate(-6px, -3px);
+            pointer-events: none; margin-right: 14px;
+        }
+        .sp-form-hint {
+            font-size: .7rem; color: var(--text-3);
+            font-weight: 500; padding-left: 2px;
+        }
+        .sp-form-summary {
+            padding: 14px 16px;
+            border-radius: 12px;
+            background: linear-gradient(135deg, var(--gold-soft), #fff);
+            border: 1px dashed rgba(176, 100, 30, .35);
+            display: flex; align-items: center; justify-content: space-between;
+            font-size: .86rem;
+        }
+        .sp-form-summary-label {
+            display: inline-flex; align-items: center; gap: 8px;
+            color: var(--text-2); font-weight: 600;
+        }
+        .sp-form-summary-label i { color: var(--gold); font-size: 1rem; }
+        .sp-form-summary-value {
+            font-family: 'Fraunces', Georgia, serif;
+            font-size: 1.2rem; font-weight: 700;
+            color: var(--gold-2);
+        }
+        .sp-btn-submit, .sp-btn-cancel, .sp-btn-danger {
+            display: inline-flex; align-items: center; justify-content: center;
+            gap: 8px;
+            padding: 12px 20px; border-radius: 11px;
+            font-size: .86rem; font-weight: 700;
+            font-family: inherit; cursor: pointer;
+            transition: transform .15s ease, filter .15s ease, border-color .18s ease, color .18s ease;
+        }
+        .sp-btn-submit {
+            border: 0;
+            background: linear-gradient(135deg, var(--gold), var(--gold-2));
+            color: #fff;
+            box-shadow: 0 3px 0 rgba(0,0,0,.12), 0 14px 24px -12px rgba(176,100,30,.75);
+        }
+        .sp-btn-submit:hover { transform: translateY(-1px); filter: brightness(1.04); }
+        .sp-btn-submit:disabled { opacity: .6; cursor: not-allowed; transform: none; }
+        .sp-btn-cancel {
+            border: 1.5px solid var(--line-2);
+            background: #fff;
+            color: var(--brown-2);
+        }
+        .sp-btn-cancel:hover { border-color: var(--gold); color: var(--gold); transform: translateY(-1px); }
+        .sp-btn-danger {
+            border: 1.5px solid var(--danger-bd);
+            background: var(--danger-bg);
+            color: var(--danger);
+            margin-right: auto;
+        }
+        .sp-btn-danger:hover { filter: brightness(1.02); transform: translateY(-1px); }
+
+        /* Toast */
+        .sp-toast {
+            position: fixed;
+            bottom: 26px; left: 50%;
+            transform: translate(-50%, 120%);
+            background: linear-gradient(135deg, #4A2C10, #2A1E10);
+            color: #fff;
+            padding: 14px 22px;
+            border-radius: 14px;
+            box-shadow: 0 24px 46px -20px rgba(0,0,0,.75);
+            display: inline-flex; align-items: center; gap: 11px;
+            font-size: .88rem; font-weight: 600;
+            z-index: 500;
+            transition: transform .38s cubic-bezier(.2,.7,.3,1);
+            border: 1px solid rgba(232, 176, 90, .3);
+            max-width: calc(100vw - 40px);
+        }
+        .sp-toast.is-visible { transform: translate(-50%, 0); }
+        .sp-toast i { font-size: 1.2rem; color: var(--gold-3); }
+        .sp-toast.is-success i { color: #7DD68A; }
+        .sp-toast.is-error i { color: #FF9B7A; }
+
+        /* Sidebar mobile overlay */
+        .sp-sidebar-overlay {
+            display: none;
+            position: fixed; inset: 0;
+            background: rgba(42, 30, 16, .5);
+            z-index: 150;
+            opacity: 0; pointer-events: none;
+            transition: opacity .25s ease;
+        }
+
+        @media (max-width: 900px) {
+            .sp-sidebar {
+                transform: translateX(-100%);
+                box-shadow: 24px 0 60px -30px rgba(0,0,0,.7);
+            }
+            body.sp-sidebar-open .sp-sidebar { transform: translateX(0); }
+            body.sp-sidebar-open .sp-sidebar-overlay {
+                display: block; opacity: 1; pointer-events: auto;
+            }
+            .sp-main { margin-left: 0; }
+            .sp-menu-btn { display: inline-flex; }
+        }
+        @media (max-width: 480px) {
+            .sp-topbar { padding: 12px 16px; }
+            .sp-content { padding: 16px; }
+            .sp-cta span { display: none; }
+            .sp-cta { padding: 10px 12px; }
+            .sp-table thead th,
+            .sp-table tbody td { padding: 10px 14px; }
+            .sp-panel-head { padding: 14px 16px; }
+            .sp-modal { max-height: calc(100vh - 20px); }
+            .sp-modal-body { padding: 18px 18px; }
+            .sp-modal-foot { padding: 12px 18px 16px; }
+        }
+        @media (prefers-reduced-motion: reduce) {
+            *, *::before, *::after {
+                animation-duration: .001ms !important;
+                transition-duration: .001ms !important;
+            }
+        }
+    </style>
+</head>
+<body class="sp-dash">
+
+<div class="sp-sidebar-overlay" id="sidebarOverlay"></div>
+
+<aside class="sp-sidebar" id="sidebar">
+
+    <a href="<?= BASE_URL ?>index.php" class="sp-sidebar-brand">
+        <h1 class="sp-sidebar-brand-name">Smart<span>Palay</span></h1>
+    </a>
+
+    <div class="sp-sidebar-user">
+        <div class="sp-user-avatar" title="SmartPalay">
+            <div class="sp-user-avatar-img">
+                <?php if ($smartPalayLogo): ?>
+                    <img src="<?= $smartPalayLogo ?>" alt="SmartPalay">
+                <?php else: ?>
+                    <i class="bi bi-image" style="font-size: 1.6rem; color: var(--text-3);"></i>
+                <?php endif; ?>
+            </div>
+        </div>
+    </div>
+
+    <div class="sp-sidebar-role">
+        <span class="sp-sidebar-role-chip">
+            <i class="bi bi-bag-check-fill"></i> Buyer
+        </span>
+    </div>
+
+    <nav class="sp-nav">
+        <span class="sp-nav-label">Overview</span>
+        <a href="<?= BASE_URL ?>buyer/dashboard.php" class="sp-nav-link">
+            <i class="bi bi-speedometer2"></i> Dashboard
+        </a>
+        <a href="<?= BASE_URL ?>buyer/purchases.php" class="sp-nav-link is-active">
+            <i class="bi bi-bag-check"></i> My Purchases
+        </a>
+        <a href="<?= BASE_URL ?>buyer/payments.php" class="sp-nav-link">
+            <i class="bi bi-cash-coin"></i> Payments
+        </a>
+
+        <span class="sp-nav-label">Records</span>
+        <a href="<?= BASE_URL ?>buyer/sellers.php" class="sp-nav-link">
+            <i class="bi bi-people"></i> Sellers
+        </a>
+        <a href="<?= BASE_URL ?>buyer/reports.php" class="sp-nav-link">
+            <i class="bi bi-graph-up-arrow"></i> Reports
+        </a>
+
+        <span class="sp-nav-label">Account</span>
+        <a href="<?= BASE_URL ?>buyer/profile.php" class="sp-nav-link">
+            <i class="bi bi-person-circle"></i> My Profile
+        </a>
+        <a href="<?= BASE_URL ?>buyer/settings.php" class="sp-nav-link">
+            <i class="bi bi-gear"></i> Settings
+        </a>
+    </nav>
+
+    <div class="sp-sidebar-foot">
+        <a href="<?= BASE_URL ?>auth/logout.php" class="sp-nav-link sp-logout">
+            <i class="bi bi-box-arrow-right"></i> Sign Out
+        </a>
+        <div class="sp-sidebar-tag">SmartPalay &copy; <?= date('Y') ?></div>
+    </div>
+</aside>
+
+<div class="sp-main">
+
+    <header class="sp-topbar">
+        <div class="sp-topbar-left">
+            <button class="sp-menu-btn" id="menuBtn" aria-label="Open menu">
+                <i class="bi bi-list"></i>
+            </button>
+            <div>
+                <h1 class="sp-page-title">My Purchases</h1>
+                <span class="sp-page-sub">Welcome back, <strong><?= $firstName ?></strong>!</span>
+            </div>
+        </div>
+
+        <div class="sp-topbar-right">
+            <button class="sp-icon-btn" id="notifBtn" aria-label="Notifications">
+                <i class="bi bi-bell"></i>
+                <span class="badge-dot"></span>
+            </button>
+            <button type="button" class="sp-cta" data-modal="newPurchase">
+                <i class="bi bi-plus-lg"></i>
+                <span>New Purchase</span>
+            </button>
+        </div>
+    </header>
+
+    <main class="sp-content">
+
+        <!-- Intro -->
+        <section class="sp-intro">
+            <div class="sp-intro-text">
+                <span class="sp-intro-tag">
+                    <i class="bi bi-bag-check"></i>
+                    Purchase Ledger
+                </span>
+                <h2>Every palay delivery, <em>organized</em>.</h2>
+                <p>
+                    Browse, filter, and manage all your palay purchases in one place.
+                    Track payments, spot outstanding balances, and stay on top of your books.
+                </p>
+                <div class="sp-intro-actions">
+                    <button type="button" class="sp-intro-btn is-primary" data-modal="newPurchase">
+                        <i class="bi bi-plus-lg"></i> Record Purchase
+                    </button>
+                    <a href="<?= BASE_URL ?>buyer/reports.php" class="sp-intro-btn is-ghost">
+                        <i class="bi bi-download"></i> Export Report
+                    </a>
+                </div>
+            </div>
+
+            <div class="sp-intro-mini">
+                <div class="sp-intro-mini-card">
+                    <div class="sp-intro-mini-label">Total</div>
+                    <div class="sp-intro-mini-value"><?= number_format($summary['total_kg'], 0) ?><small>kg</small></div>
+                </div>
+                <div class="sp-intro-mini-card">
+                    <div class="sp-intro-mini-label">Paid</div>
+                    <div class="sp-intro-mini-value"><?= peso($summary['total_paid']) ?></div>
+                </div>
+                <div class="sp-intro-mini-card">
+                    <div class="sp-intro-mini-label">Balance</div>
+                    <div class="sp-intro-mini-value"><?= peso($summary['total_balance']) ?></div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Toolbar -->
+        <form class="sp-toolbar" method="get" action="">
+            <?php if ($sortKey !== 'created_at' || $sortDir !== 'DESC'): ?>
+                <input type="hidden" name="sort" value="<?= sanitize($sortKey) ?>">
+                <input type="hidden" name="dir"  value="<?= strtolower($sortDir) ?>">
+            <?php endif; ?>
+
+            <div class="sp-status-tabs">
+                <?php
+                    $tabs = [
+                        'all'     => ['All',     $stats['all'],     'bi-grid'],
+                        'paid'    => ['Paid',    $stats['paid'],    'bi-check-circle'],
+                        'partial' => ['Partial', $stats['partial'], 'bi-circle-half'],
+                        'unpaid'  => ['Unpaid',  $stats['unpaid'],  'bi-x-circle'],
+                        'pending' => ['Pending', $stats['pending'], 'bi-hourglass-split'],
+                    ];
+                    foreach ($tabs as $key => $meta):
+                        $isActive = ($statusFilter === $key || ($key === 'all' && $statusFilter === 'all'));
+                ?>
+                    <a href="?<?= qs(['status' => $key === 'all' ? null : $key, 'page' => 1]) ?>"
+                       class="sp-status-tab <?= $isActive ? 'is-active' : '' ?>">
+                        <i class="bi <?= $meta[2] ?>"></i>
+                        <?= $meta[0] ?>
+                        <span class="count"><?= (int) $meta[1] ?></span>
+                    </a>
+                <?php endforeach; ?>
+            </div>
+
+            <div class="sp-filter-row">
+                <div class="sp-field">
+                    <i class="bi bi-search"></i>
+                    <input type="search" name="q" value="<?= sanitize($search) ?>" placeholder="Search by reference, seller, notes…">
+                </div>
+
+                <div class="sp-field">
+                    <i class="bi bi-calendar3"></i>
+                    <input type="date" name="from" value="<?= sanitize($dateFrom) ?>" aria-label="From date">
+                </div>
+
+                <div class="sp-field">
+                    <i class="bi bi-calendar3"></i>
+                    <input type="date" name="to" value="<?= sanitize($dateTo) ?>" aria-label="To date">
+                </div>
+
+                <div class="sp-field is-select">
+                    <i class="bi bi-sort-down"></i>
+                    <select name="sort" aria-label="Sort by">
+                        <?php
+                            $sortOptions = [
+                                'created_at'   => 'Newest first',
+                                'reference_no' => 'Reference',
+                                'seller_name'  => 'Seller',
+                                'weight_kg'    => 'Weight',
+                                'total_amount' => 'Amount',
+                                'balance'      => 'Balance',
+                                'status'       => 'Status',
+                            ];
+                            foreach ($sortOptions as $k => $label):
+                        ?>
+                            <option value="<?= $k ?>" <?= $sortKey === $k ? 'selected' : '' ?>>
+                                <?= $label ?>
+                            </option>
+                        <?php endforeach; ?>
+                    </select>
+                </div>
+
+                <button type="submit" class="sp-btn-primary">
+                    <i class="bi bi-funnel"></i> Apply
+                </button>
+
+                <a href="<?= BASE_URL ?>buyer/purchases.php" class="sp-btn-ghost">
+                    <i class="bi bi-arrow-counterclockwise"></i> Reset
+                </a>
+            </div>
+        </form>
+
+        <!-- Summary -->
+        <section class="sp-summary-strip">
+            <div class="sp-summary-card">
+                <div class="sp-summary-ico"><i class="bi bi-box-seam"></i></div>
+                <div class="sp-summary-body">
+                    <div class="sp-summary-label">Total Palay</div>
+                    <div class="sp-summary-value"><?= number_format($summary['total_kg'], 0) ?><small>kg</small></div>
+                </div>
+            </div>
+            <div class="sp-summary-card">
+                <div class="sp-summary-ico is-info"><i class="bi bi-receipt"></i></div>
+                <div class="sp-summary-body">
+                    <div class="sp-summary-label">Total Amount</div>
+                    <div class="sp-summary-value"><?= peso($summary['total_amount']) ?></div>
+                </div>
+            </div>
+            <div class="sp-summary-card">
+                <div class="sp-summary-ico is-success"><i class="bi bi-cash-stack"></i></div>
+                <div class="sp-summary-body">
+                    <div class="sp-summary-label">Total Paid</div>
+                    <div class="sp-summary-value"><?= peso($summary['total_paid']) ?></div>
+                </div>
+            </div>
+            <div class="sp-summary-card">
+                <div class="sp-summary-ico is-warn"><i class="bi bi-hourglass-split"></i></div>
+                <div class="sp-summary-body">
+                    <div class="sp-summary-label">Outstanding</div>
+                    <div class="sp-summary-value"><?= peso($summary['total_balance']) ?></div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Purchases table -->
+        <section class="sp-panel">
+            <div class="sp-panel-head">
+                <h3 class="sp-panel-title">
+                    <i class="bi bi-list-ul"></i>
+                    Purchase Records
+                </h3>
+                <span class="sp-panel-meta">
+                    Showing <strong><?= count($purchases) ?></strong> of <strong><?= number_format($totalRows) ?></strong>
+                </span>
+            </div>
+
+            <?php if (!empty($purchases)): ?>
+                <div class="sp-table-wrap">
+                    <table class="sp-table">
+                        <thead>
+                            <tr>
+                                <?php
+                                    $colSorts = [
+                                        'reference_no' => 'Reference',
+                                        'seller_name'  => 'Seller',
+                                        'weight_kg'    => 'Weight',
+                                        'total_amount' => 'Amount',
+                                        'balance'      => 'Balance',
+                                        'status'       => 'Status',
+                                        'created_at'   => 'Date',
+                                    ];
+                                    foreach ($colSorts as $k => $label):
+                                        $active   = $sortKey === $k;
+                                        $nextDir  = ($active && $sortDir === 'ASC') ? 'desc' : 'asc';
+                                        $iconCls  = $active ? ($sortDir === 'ASC' ? 'bi-arrow-up' : 'bi-arrow-down') : 'bi-arrow-down-up';
+                                ?>
+                                    <th>
+                                        <a href="?<?= qs(['sort' => $k, 'dir' => $nextDir, 'page' => 1]) ?>"
+                                           class="<?= $active ? 'is-sorted' : '' ?>">
+                                            <?= $label ?>
+                                            <i class="bi <?= $iconCls ?>"></i>
+                                        </a>
+                                    </th>
+                                <?php endforeach; ?>
+                                <th style="text-align:right;">Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <?php foreach ($purchases as $p): ?>
+                                <?php
+                                    [$badgeCls, $badgeIco, $badgeLabel] = statusMeta($p['status'] ?? 'pending');
+                                    $initial = strtoupper(mb_substr(trim($p['seller_name'] ?: '?'), 0, 1));
+                                ?>
+                                <tr data-purchase='<?= htmlspecialchars(json_encode([
+                                    'id'           => (int) $p['id'],
+                                    'reference_no' => $p['reference_no'] ?? '',
+                                    'seller_name'  => $p['seller_name'] ?? '',
+                                    'weight_kg'    => (float) $p['weight_kg'],
+                                    'price_per_kg' => (float) ($p['price_per_kg'] ?? 0),
+                                    'total_amount' => (float) $p['total_amount'],
+                                    'amount_paid'  => (float) ($p['amount_paid'] ?? 0),
+                                    'balance'      => (float) $p['balance'],
+                                    'status'       => strtolower($p['status'] ?? 'pending'),
+                                    'notes'        => $p['notes'] ?? '',
+                                    'created_at'   => $p['created_at'] ?? '',
+                                ]), ENT_QUOTES, 'UTF-8') ?>'>
+                                    <td><span class="sp-ref"><?= sanitize($p['reference_no'] ?? '—') ?></span></td>
+                                    <td>
+                                        <div class="sp-seller">
+                                            <span class="sp-seller-avatar"><?= sanitize($initial) ?></span>
+                                            <span class="sp-seller-name"><?= sanitize($p['seller_name'] ?? '—') ?></span>
+                                        </div>
+                                    </td>
+                                    <td><?= kg($p['weight_kg'] ?? 0) ?></td>
+                                    <td><span class="sp-money"><?= peso($p['total_amount'] ?? 0) ?></span></td>
+                                    <td>
+                                        <span class="sp-money <?= ((float) $p['balance']) > 0 ? 'is-danger' : 'is-success' ?>">
+                                            <?= peso($p['balance'] ?? 0) ?>
+                                        </span>
+                                    </td>
+                                    <td>
+                                        <span class="sp-badge <?= $badgeCls ?>">
+                                            <i class="bi <?= $badgeIco ?>"></i> <?= $badgeLabel ?>
+                                        </span>
+                                    </td>
+                                    <td><?= niceDate($p['created_at'] ?? null) ?></td>
+                                    <td style="text-align:right;">
+                                        <div class="sp-row-actions" onclick="event.stopPropagation();">
+                                            <button type="button" class="sp-row-btn" title="View details" data-action="view" data-id="<?= (int) $p['id'] ?>">
+                                                <i class="bi bi-eye"></i>
+                                            </button>
+                                            <button type="button" class="sp-row-btn" title="Edit" data-action="edit" data-id="<?= (int) $p['id'] ?>">
+                                                <i class="bi bi-pencil"></i>
+                                            </button>
+                                            <button type="button" class="sp-row-btn is-danger" title="Delete" data-action="delete" data-id="<?= (int) $p['id'] ?>">
+                                                <i class="bi bi-trash3"></i>
+                                            </button>
+                                        </div>
+                                    </td>
+                                </tr>
+                            <?php endforeach; ?>
+                        </tbody>
+                    </table>
+                </div>
+
+                <!-- Pagination -->
+                <?php if ($totalPages > 1): ?>
+                    <div class="sp-pagination">
+                        <span class="sp-pagination-info">
+                            Page <strong><?= $page ?></strong> of <strong><?= $totalPages ?></strong>
+                        </span>
+                        <div class="sp-pagination-list">
+                            <a href="?<?= qs(['page' => max(1, $page - 1)]) ?>"
+                               class="sp-page-link <?= $page <= 1 ? 'is-disabled' : '' ?>">
+                                <i class="bi bi-chevron-left"></i>
+                            </a>
+
+                            <?php
+                                $window = 2;
+                                $start  = max(1, $page - $window);
+                                $end    = min($totalPages, $page + $window);
+                                if ($start > 1) {
+                                    echo '<a href="?' . qs(['page' => 1]) . '" class="sp-page-link">1</a>';
+                                    if ($start > 2) echo '<span class="sp-page-dots">…</span>';
+                                }
+                                for ($i = $start; $i <= $end; $i++) {
+                                    $active = $i === $page ? 'is-active' : '';
+                                    echo '<a href="?' . qs(['page' => $i]) . '" class="sp-page-link ' . $active . '">' . $i . '</a>';
+                                }
+                                if ($end < $totalPages) {
+                                    if ($end < $totalPages - 1) echo '<span class="sp-page-dots">…</span>';
+                                    echo '<a href="?' . qs(['page' => $totalPages]) . '" class="sp-page-link">' . $totalPages . '</a>';
+                                }
+                            ?>
+
+                            <a href="?<?= qs(['page' => min($totalPages, $page + 1)]) ?>"
+                               class="sp-page-link <?= $page >= $totalPages ? 'is-disabled' : '' ?>">
+                                <i class="bi bi-chevron-right"></i>
+                            </a>
+                        </div>
+                    </div>
+                <?php endif; ?>
+
+            <?php else: ?>
+                <div class="sp-empty">
+                    <div class="sp-empty-ico"><i class="bi bi-bag"></i></div>
+                    <h4>
+                        <?php if ($search !== '' || $statusFilter !== 'all' || $dateFrom || $dateTo): ?>
+                            No purchases match your filters
+                        <?php else: ?>
+                            No purchases yet
+                        <?php endif; ?>
+                    </h4>
+                    <p>
+                        <?php if ($search !== '' || $statusFilter !== 'all' || $dateFrom || $dateTo): ?>
+                            Try adjusting your search or clearing some filters to see more results.
+                        <?php else: ?>
+                            Your palay purchase records will appear here. Record your first delivery to get started.
+                        <?php endif; ?>
+                    </p>
+                    <div class="sp-empty-actions">
+                        <?php if ($search !== '' || $statusFilter !== 'all' || $dateFrom || $dateTo): ?>
+                            <a href="<?= BASE_URL ?>buyer/purchases.php" class="sp-btn-cancel">
+                                <i class="bi bi-arrow-counterclockwise"></i> Clear filters
+                            </a>
+                        <?php endif; ?>
+                        <button type="button" class="sp-btn-primary" data-modal="newPurchase">
+                            <i class="bi bi-plus-lg"></i> Record Purchase
+                        </button>
+                    </div>
+                </div>
+            <?php endif; ?>
+        </section>
+
+    </main>
+</div>
+
+<!-- NEW PURCHASE MODAL -->
+<div class="sp-modal-backdrop" id="modalNewPurchase">
+    <div class="sp-modal" role="dialog" aria-modal="true" aria-labelledby="npTitle">
+        <div class="sp-modal-head">
+            <button type="button" class="sp-modal-close" data-close-modal aria-label="Close">
+                <i class="bi bi-x-lg"></i>
+            </button>
+            <span class="sp-modal-tag">
+                <i class="bi bi-plus-circle"></i>
+                New Purchase
+            </span>
+            <h3 class="sp-modal-title" id="npTitle">Record a Palay Purchase</h3>
+            <p class="sp-modal-sub">Fill in the delivery details and we'll calculate the total automatically.</p>
+        </div>
+
+        <form id="newPurchaseForm" autocomplete="off" style="display: contents;">
+            <div class="sp-modal-body">
+
+                <div class="sp-form-row">
+
+                    <div class="sp-form-field is-full">
+                        <label for="npSeller">Seller <span class="req">*</span></label>
+                        <div class="sp-form-input is-select">
+                            <i class="bi bi-person"></i>
+                            <select id="npSeller" name="seller_name" required>
+                                <option value="">— Select a seller —</option>
+                                <?php foreach ($sellersList as $seller): ?>
+                                    <option value="<?= sanitize($seller) ?>"><?= sanitize($seller) ?></option>
+                                <?php endforeach; ?>
+                                <option value="__new__">+ Add new seller…</option>
+                            </select>
+                        </div>
+                        <div class="sp-form-hint">Choose an existing seller or add a new one.</div>
+                    </div>
+
+                    <div class="sp-form-field is-full" id="npNewSellerWrap" style="display:none;">
+                        <label for="npNewSeller">New Seller Name <span class="req">*</span></label>
+                        <div class="sp-form-input">
+                            <i class="bi bi-person-plus"></i>
+                            <input type="text" id="npNewSeller" placeholder="e.g. Mang Jose">
+                        </div>
+                    </div>
+
+                    <div class="sp-form-field">
+                        <label for="npWeight">Weight <span class="req">*</span></label>
+                        <div class="sp-form-input">
+                            <i class="bi bi-box-seam"></i>
+                            <input type="number" id="npWeight" name="weight_kg" min="0.01" step="0.01" placeholder="0.00" required>
+                        </div>
+                        <div class="sp-form-hint">In kilograms (kg)</div>
+                    </div>
+
+                    <div class="sp-form-field">
+                        <label for="npPrice">Price per kg <span class="req">*</span></label>
+                        <div class="sp-form-input">
+                            <i class="bi bi-tag"></i>
+                            <input type="number" id="npPrice" name="price_per_kg" min="0.01" step="0.01" placeholder="0.00" required>
+                        </div>
+                        <div class="sp-form-hint">In pesos (₱)</div>
+                    </div>
+
+                    <div class="sp-form-field">
+                        <label for="npPaid">Amount Paid (optional)</label>
+                        <div class="sp-form-input">
+                            <i class="bi bi-cash-stack"></i>
+                            <input type="number" id="npPaid" name="amount_paid" min="0" step="0.01" placeholder="0.00">
+                        </div>
+                        <div class="sp-form-hint">Leave blank if unpaid</div>
+                    </div>
+
+                    <div class="sp-form-field">
+                        <label for="npDate">Delivery Date</label>
+                        <div class="sp-form-input">
+                            <i class="bi bi-calendar3"></i>
+                            <input type="date" id="npDate" name="created_at">
+                        </div>
+                        <div class="sp-form-hint">Leave blank to use today.</div>
+                    </div>
+
+                    <div class="sp-form-field is-full">
+                        <label for="npNotes">Notes (optional)</label>
+                        <div class="sp-form-input">
+                            <i class="bi bi-chat-left-text"></i>
+                            <textarea id="npNotes" name="notes" placeholder="e.g. Delivered to warehouse 2, dry palay…"></textarea>
+                        </div>
+                    </div>
+
+                </div>
+
+                <div class="sp-form-summary">
+                    <span class="sp-form-summary-label"><i class="bi bi-calculator"></i> Total Amount</span>
+                    <span class="sp-form-summary-value" id="npTotal">₱0.00</span>
+                </div>
+
+                <div class="sp-form-summary" style="background: linear-gradient(135deg, #EAF7EC, #fff); border-color: var(--success-bd);">
+                    <span class="sp-form-summary-label"><i class="bi bi-hourglass-split"></i> Balance (remaining)</span>
+                    <span class="sp-form-summary-value" id="npBalance" style="color: var(--danger);">₱0.00</span>
+                </div>
+
+            </div>
+
+            <div class="sp-modal-foot">
+                <button type="button" class="sp-btn-cancel" data-close-modal>
+                    <i class="bi bi-x-lg"></i> Cancel
+                </button>
+                <button type="submit" class="sp-btn-submit" id="npSubmit">
+                    <i class="bi bi-check-lg"></i> Save Purchase
+                </button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- VIEW MODAL -->
+<div class="sp-modal-backdrop" id="modalView">
+    <div class="sp-modal" role="dialog" aria-modal="true" aria-labelledby="vwTitle">
+        <div class="sp-modal-head">
+            <button type="button" class="sp-modal-close" data-close-modal aria-label="Close">
+                <i class="bi bi-x-lg"></i>
+            </button>
+            <span class="sp-modal-tag">
+                <i class="bi bi-eye"></i>
+                Purchase Details
+            </span>
+            <h3 class="sp-modal-title" id="vwTitle">Purchase Record</h3>
+            <p class="sp-modal-sub" id="vwSub">Loading…</p>
+        </div>
+
+        <div class="sp-modal-body" id="vwBody"></div>
+
+        <div class="sp-modal-foot">
+            <button type="button" class="sp-btn-cancel" data-close-modal>
+                <i class="bi bi-x-lg"></i> Close
+            </button>
+            <button type="button" class="sp-btn-primary" id="vwEditBtn">
+                <i class="bi bi-pencil"></i> Edit
+            </button>
+        </div>
+    </div>
+</div>
+
+<!-- EDIT MODAL -->
+<div class="sp-modal-backdrop" id="modalEdit">
+    <div class="sp-modal" role="dialog" aria-modal="true" aria-labelledby="edTitle">
+        <div class="sp-modal-head">
+            <button type="button" class="sp-modal-close" data-close-modal aria-label="Close">
+                <i class="bi bi-x-lg"></i>
+            </button>
+            <span class="sp-modal-tag">
+                <i class="bi bi-pencil"></i>
+                Edit Purchase
+            </span>
+            <h3 class="sp-modal-title" id="edTitle">Update Purchase</h3>
+            <p class="sp-modal-sub">Adjust the details below and save your changes.</p>
+        </div>
+
+        <form id="editPurchaseForm" autocomplete="off" style="display: contents;">
+            <input type="hidden" id="edId">
+
+            <div class="sp-modal-body">
+
+                <div class="sp-form-row">
+
+                    <div class="sp-form-field is-full">
+                        <label for="edSeller">Seller <span class="req">*</span></label>
+                        <div class="sp-form-input is-select">
+                            <i class="bi bi-person"></i>
+                            <select id="edSeller" name="seller_name" required>
+                                <option value="">— Select a seller —</option>
+                                <?php foreach ($sellersList as $seller): ?>
+                                    <option value="<?= sanitize($seller) ?>"><?= sanitize($seller) ?></option>
+                                <?php endforeach; ?>
+                            </select>
+                        </div>
+                    </div>
+
+                    <div class="sp-form-field">
+                        <label for="edWeight">Weight <span class="req">*</span></label>
+                        <div class="sp-form-input">
+                            <i class="bi bi-box-seam"></i>
+                            <input type="number" id="edWeight" name="weight_kg" min="0.01" step="0.01" required>
+                        </div>
+                    </div>
+
+                    <div class="sp-form-field">
+                        <label for="edPrice">Price per kg <span class="req">*</span></label>
+                        <div class="sp-form-input">
+                            <i class="bi bi-tag"></i>
+                            <input type="number" id="edPrice" name="price_per_kg" min="0.01" step="0.01" required>
+                        </div>
+                    </div>
+
+                    <div class="sp-form-field">
+                        <label for="edPaid">Amount Paid</label>
+                        <div class="sp-form-input">
+                            <i class="bi bi-cash-stack"></i>
+                            <input type="number" id="edPaid" name="amount_paid" min="0" step="0.01">
+                        </div>
+                    </div>
+
+                    <div class="sp-form-field">
+                        <label for="edDate">Delivery Date</label>
+                        <div class="sp-form-input">
+                            <i class="bi bi-calendar3"></i>
+                            <input type="date" id="edDate" name="created_at">
+                        </div>
+                    </div>
+
+                    <div class="sp-form-field is-full">
+                        <label for="edNotes">Notes</label>
+                        <div class="sp-form-input">
+                            <i class="bi bi-chat-left-text"></i>
+                            <textarea id="edNotes" name="notes"></textarea>
+                        </div>
+                    </div>
+
+                </div>
+
+                <div class="sp-form-summary">
+                    <span class="sp-form-summary-label"><i class="bi bi-calculator"></i> Total Amount</span>
+                    <span class="sp-form-summary-value" id="edTotal">₱0.00</span>
+                </div>
+
+                <div class="sp-form-summary" style="background: linear-gradient(135deg, #EAF7EC, #fff); border-color: var(--success-bd);">
+                    <span class="sp-form-summary-label"><i class="bi bi-hourglass-split"></i> Balance (remaining)</span>
+                    <span class="sp-form-summary-value" id="edBalance" style="color: var(--danger);">₱0.00</span>
+                </div>
+
+            </div>
+
+            <div class="sp-modal-foot">
+                <button type="button" class="sp-btn-danger" id="edDeleteBtn">
+                    <i class="bi bi-trash3"></i> Delete
+                </button>
+                <button type="button" class="sp-btn-cancel" data-close-modal>
+                    <i class="bi bi-x-lg"></i> Cancel
+                </button>
+                <button type="submit" class="sp-btn-submit" id="edSubmit">
+                    <i class="bi bi-check-lg"></i> Save Changes
+                </button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- DELETE CONFIRM MODAL -->
+<div class="sp-modal-backdrop" id="modalDelete">
+    <div class="sp-modal" role="dialog" aria-modal="true" aria-labelledby="dlTitle" style="max-width: 460px;">
+        <div class="sp-modal-head">
+            <button type="button" class="sp-modal-close" data-close-modal aria-label="Close">
+                <i class="bi bi-x-lg"></i>
+            </button>
+            <span class="sp-modal-tag" style="background: rgba(162, 58, 26, .2); border-color: rgba(162, 58, 26, .4); color: #FFB199;">
+                <i class="bi bi-exclamation-triangle"></i>
+                Delete
+            </span>
+            <h3 class="sp-modal-title" id="dlTitle">Delete this purchase?</h3>
+            <p class="sp-modal-sub">This action cannot be undone. The record will be permanently removed from your ledger.</p>
+        </div>
+        <div class="sp-modal-body">
+            <div class="sp-detail-hero" style="background: linear-gradient(135deg, var(--danger-bg), #fff); border-color: var(--danger-bd);">
+                <div>
+                    <div class="sp-detail-hero-label">Reference</div>
+                    <div class="sp-detail-hero-value" id="dlRef" style="font-size: 1.15rem;">—</div>
+                </div>
+                <div style="text-align:right;">
+                    <div class="sp-detail-hero-label">Amount</div>
+                    <div class="sp-detail-hero-value" id="dlAmount" style="font-size: 1.15rem; color: var(--danger);">—</div>
+                </div>
+            </div>
+        </div>
+        <div class="sp-modal-foot">
+            <button type="button" class="sp-btn-cancel" data-close-modal>
+                <i class="bi bi-x-lg"></i> Cancel
+            </button>
+            <button type="button" class="sp-btn-submit" id="dlConfirmBtn" style="background: linear-gradient(135deg, #A23A1A, #C4481F); box-shadow: 0 3px 0 rgba(0,0,0,.12), 0 14px 24px -12px rgba(162,58,26,.75);">
+                <i class="bi bi-trash3"></i> Delete Purchase
+            </button>
+        </div>
+    </div>
+</div>
+
+<div class="sp-toast" id="spToast">
+    <i class="bi bi-check-circle-fill" id="spToastIcon"></i>
+    <span id="spToastText">Saved</span>
+</div>
+
+<script>
+(() => {
+    'use strict';
+
+    const body    = document.body;
+    const menuBtn = document.getElementById('menuBtn');
+    const overlay = document.getElementById('sidebarOverlay');
+
+    function openSidebar()  { body.classList.add('sp-sidebar-open'); }
+    function closeSidebar() { body.classList.remove('sp-sidebar-open'); }
+
+    menuBtn?.addEventListener('click', openSidebar);
+    overlay?.addEventListener('click', closeSidebar);
+    document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeSidebar(); });
+    window.addEventListener('resize', () => { if (window.innerWidth > 900) closeSidebar(); });
+
+    /* ----------------------------------------------------------
+       Toast
+    ---------------------------------------------------------- */
+    const toast     = document.getElementById('spToast');
+    const toastIcon = document.getElementById('spToastIcon');
+    const toastText = document.getElementById('spToastText');
+    let toastTimer;
+
+    function showToast(message, type = 'success') {
+        toastText.textContent = message;
+        toast.classList.remove('is-success', 'is-error');
+        toastIcon.className = 'bi ' + (type === 'error' ? 'bi-exclamation-triangle-fill' : 'bi-check-circle-fill');
+        toast.classList.add('is-' + type, 'is-visible');
+        clearTimeout(toastTimer);
+        toastTimer = setTimeout(() => toast.classList.remove('is-visible'), 3200);
+    }
+
+    /* ----------------------------------------------------------
+       Modal helpers
+    ---------------------------------------------------------- */
+    const modalNew    = document.getElementById('modalNewPurchase');
+    const modalView   = document.getElementById('modalView');
+    const modalEdit   = document.getElementById('modalEdit');
+    const modalDelete = document.getElementById('modalDelete');
+    const modals = { newPurchase: modalNew, view: modalView, edit: modalEdit, delete: modalDelete };
+
+    function openModal(m) {
+        if (!m) return;
+        m.classList.add('is-open');
+        body.style.overflow = 'hidden';
+    }
+    function closeModal(m) {
+        if (!m) return;
+        m.classList.remove('is-open');
+        if (!document.querySelector('.sp-modal-backdrop.is-open')) {
+            body.style.overflow = '';
+        }
+    }
+
+    document.querySelectorAll('[data-modal]').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+            e.preventDefault();
+            const name = btn.dataset.modal;
+            if (name === 'newPurchase') resetNewPurchaseForm();
+            openModal(modals[name]);
+        });
+    });
+
+    document.querySelectorAll('[data-close-modal]').forEach(btn => {
+        btn.addEventListener('click', () => closeModal(btn.closest('.sp-modal-backdrop')));
+    });
+    document.querySelectorAll('.sp-modal-backdrop').forEach(m => {
+        m.addEventListener('click', (e) => { if (e.target === m) closeModal(m); });
+    });
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') {
+            const open = [...document.querySelectorAll('.sp-modal-backdrop.is-open')].pop();
+            if (open) closeModal(open);
+        }
+    });
+
+    /* ----------------------------------------------------------
+       Money helper
+    ---------------------------------------------------------- */
+    function pesoFmt(n) {
+        n = Number(n) || 0;
+        return '₱' + n.toLocaleString('en-PH', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    }
+    function esc(str) {
+        return String(str ?? '').replace(/[&<>"']/g, (c) => ({
+            '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+        })[c]);
+    }
+
+    /* ----------------------------------------------------------
+       New Purchase form
+    ---------------------------------------------------------- */
+    const npForm          = document.getElementById('newPurchaseForm');
+    const npSeller        = document.getElementById('npSeller');
+    const npNewSellerWrap = document.getElementById('npNewSellerWrap');
+    const npNewSeller     = document.getElementById('npNewSeller');
+    const npWeight        = document.getElementById('npWeight');
+    const npPrice         = document.getElementById('npPrice');
+    const npPaid          = document.getElementById('npPaid');
+    const npTotal         = document.getElementById('npTotal');
+    const npBalance       = document.getElementById('npBalance');
+    const npSubmit        = document.getElementById('npSubmit');
+
+    npSeller?.addEventListener('change', () => {
+        const isNew = npSeller.value === '__new__';
+        npNewSellerWrap.style.display = isNew ? '' : 'none';
+        if (isNew) npNewSeller.focus();
+    });
+
+    function recalcNew() {
+        const w    = parseFloat(npWeight?.value) || 0;
+        const p    = parseFloat(npPrice?.value)  || 0;
+        const paid = parseFloat(npPaid?.value)   || 0;
+        const total   = w * p;
+        const balance = Math.max(0, total - paid);
+        npTotal.textContent   = pesoFmt(total);
+        npBalance.textContent = pesoFmt(balance);
+        npBalance.style.color = balance <= 0 ? 'var(--success)' : 'var(--danger)';
+    }
+    npWeight?.addEventListener('input', recalcNew);
+    npPrice?.addEventListener('input', recalcNew);
+    npPaid?.addEventListener('input', recalcNew);
+
+    function resetNewPurchaseForm() {
+        npForm?.reset();
+        npNewSellerWrap.style.display = 'none';
+        document.getElementById('npDate').value = '';   // empty by default
+        recalcNew();
+        const bodyEl = modalNew.querySelector('.sp-modal-body');
+        if (bodyEl) bodyEl.scrollTop = 0;
+    }
+
+    npForm?.addEventListener('submit', async (e) => {
+        e.preventDefault();
+
+        let sellerName = npSeller.value;
+        if (sellerName === '__new__') {
+            sellerName = (npNewSeller.value || '').trim();
+            if (!sellerName) { showToast('Please enter the new seller name.', 'error'); npNewSeller.focus(); return; }
+        }
+        if (!sellerName) { showToast('Please select a seller.', 'error'); npSeller.focus(); return; }
+
+        const payload = {
+            seller_name:  sellerName,
+            weight_kg:    parseFloat(npWeight.value) || 0,
+            price_per_kg: parseFloat(npPrice.value)  || 0,
+            amount_paid:  parseFloat(npPaid.value)   || 0,
+            created_at:   document.getElementById('npDate').value || '',
+            notes:        document.getElementById('npNotes').value || '',
+        };
+
+        if (payload.weight_kg <= 0)    { showToast('Please enter a valid weight.', 'error'); npWeight.focus(); return; }
+        if (payload.price_per_kg <= 0) { showToast('Please enter a valid price per kg.', 'error'); npPrice.focus(); return; }
+
+        npSubmit.disabled = true;
+        const originalHtml = npSubmit.innerHTML;
+        npSubmit.innerHTML = '<span class="spinner-border spinner-border-sm"></span> Saving…';
+
+        try {
+            const res = await fetch('<?= BASE_URL ?>buyer/save_purchase.php', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload),
+            });
+            const data = await res.json().catch(() => ({}));
+            if (res.ok && data.success) {
+                showToast('Purchase saved successfully!', 'success');
+                closeModal(modalNew);
+                setTimeout(() => window.location.reload(), 700);
+            } else {
+                showToast(data.message || 'Could not save purchase.', 'error');
+            }
+        } catch (err) {
+            showToast('Network error. Please try again.', 'error');
+        } finally {
+            npSubmit.disabled = false;
+            npSubmit.innerHTML = originalHtml;
+        }
+    });
+
+    /* ----------------------------------------------------------
+       Row actions
+    ---------------------------------------------------------- */
+    let currentPurchase = null;
+
+    document.querySelectorAll('tr[data-purchase]').forEach(row => {
+        const data = JSON.parse(row.dataset.purchase);
+        row.addEventListener('click', (e) => {
+            if (e.target.closest('.sp-row-actions')) return;
+            openView(data);
+        });
+    });
+
+    document.querySelectorAll('[data-action]').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const row = btn.closest('tr[data-purchase]');
+            if (!row) return;
+            const data = JSON.parse(row.dataset.purchase);
+            const action = btn.dataset.action;
+            if (action === 'view')   openView(data);
+            if (action === 'edit')   openEdit(data);
+            if (action === 'delete') openDelete(data);
+        });
+    });
+
+    /* ----------------------------------------------------------
+       View modal
+    ---------------------------------------------------------- */
+    const vwTitle    = document.getElementById('vwTitle');
+    const vwSub      = document.getElementById('vwSub');
+    const vwBody     = document.getElementById('vwBody');
+    const vwEditBtn  = document.getElementById('vwEditBtn');
+
+    function statusLabel(st) {
+        st = (st || 'pending').toLowerCase();
+        const map = {
+            paid:    ['sp-badge-paid',    'bi-check-circle-fill', 'Paid'],
+            partial: ['sp-badge-partial', 'bi-circle-half',        'Partial'],
+            unpaid:  ['sp-badge-unpaid',  'bi-x-circle-fill',     'Unpaid'],
+            pending: ['sp-badge-pending', 'bi-hourglass-split',   'Pending'],
+        };
+        return map[st] || map.pending;
+    }
+
+    function openView(p) {
+        currentPurchase = p;
+        const [badgeCls, badgeIco, badgeLabel] = statusLabel(p.status);
+
+        vwTitle.textContent = p.reference_no || 'Purchase Record';
+        vwSub.textContent   = `From ${p.seller_name || '—'} · ${p.created_at ? new Date(p.created_at).toLocaleDateString('en-US', { month:'short', day:'numeric', year:'numeric' }) : '—'}`;
+
+        vwBody.innerHTML = `
+            <div class="sp-detail-hero">
+                <div>
+                    <div class="sp-detail-hero-label">Total Amount</div>
+                    <div class="sp-detail-hero-value">${pesoFmt(p.total_amount)}</div>
+                </div>
+                <span class="sp-badge ${badgeCls}" style="font-size:.72rem;">
+                    <i class="bi ${badgeIco}"></i> ${badgeLabel}
+                </span>
+            </div>
+
+            <div class="sp-detail-grid">
+                <div class="sp-detail-item">
+                    <div class="sp-detail-label">Reference</div>
+                    <div class="sp-detail-value is-mono">${esc(p.reference_no || '—')}</div>
+                </div>
+                <div class="sp-detail-item">
+                    <div class="sp-detail-label">Delivery Date</div>
+                    <div class="sp-detail-value">${p.created_at ? new Date(p.created_at).toLocaleDateString('en-US', { month:'short', day:'numeric', year:'numeric' }) : '—'}</div>
+                </div>
+                <div class="sp-detail-item">
+                    <div class="sp-detail-label">Seller</div>
+                    <div class="sp-detail-value">${esc(p.seller_name || '—')}</div>
+                </div>
+                <div class="sp-detail-item">
+                    <div class="sp-detail-label">Weight</div>
+                    <div class="sp-detail-value">${Number(p.weight_kg).toLocaleString('en-PH', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} kg</div>
+                </div>
+                <div class="sp-detail-item">
+                    <div class="sp-detail-label">Price per kg</div>
+                    <div class="sp-detail-value">${pesoFmt(p.price_per_kg)}</div>
+                </div>
+                <div class="sp-detail-item">
+                    <div class="sp-detail-label">Amount Paid</div>
+                    <div class="sp-detail-value" style="color: var(--success);">${pesoFmt(p.amount_paid)}</div>
+                </div>
+                <div class="sp-detail-item">
+                    <div class="sp-detail-label">Balance</div>
+                    <div class="sp-detail-value" style="color: ${p.balance > 0 ? 'var(--danger)' : 'var(--success)'};">${pesoFmt(p.balance)}</div>
+                </div>
+                <div class="sp-detail-item">
+                    <div class="sp-detail-label">Status</div>
+                    <div class="sp-detail-value"><span class="sp-badge ${badgeCls}"><i class="bi ${badgeIco}"></i> ${badgeLabel}</span></div>
+                </div>
+                ${p.notes ? `
+                    <div class="sp-detail-item is-full">
+                        <div class="sp-detail-label">Notes</div>
+                        <div class="sp-detail-value is-muted" style="font-weight:500; font-size:.86rem; white-space:pre-wrap;">${esc(p.notes)}</div>
+                    </div>
+                ` : ''}
+            </div>
+        `;
+
+        openModal(modalView);
+    }
+
+    vwEditBtn?.addEventListener('click', () => {
+        closeModal(modalView);
+        if (currentPurchase) setTimeout(() => openEdit(currentPurchase), 220);
+    });
+
+    /* ----------------------------------------------------------
+       Edit modal
+    ---------------------------------------------------------- */
+    const edForm    = document.getElementById('editPurchaseForm');
+    const edId      = document.getElementById('edId');
+    const edSeller  = document.getElementById('edSeller');
+    const edWeight  = document.getElementById('edWeight');
+    const edPrice   = document.getElementById('edPrice');
+    const edPaid    = document.getElementById('edPaid');
+    const edDate    = document.getElementById('edDate');
+    const edNotes   = document.getElementById('edNotes');
+    const edTotal   = document.getElementById('edTotal');
+    const edBalance = document.getElementById('edBalance');
+    const edSubmit  = document.getElementById('edSubmit');
+
+    function recalcEdit() {
+        const w    = parseFloat(edWeight?.value) || 0;
+        const p    = parseFloat(edPrice?.value)  || 0;
+        const paid = parseFloat(edPaid?.value)   || 0;
+        const total   = w * p;
+        const balance = Math.max(0, total - paid);
+        edTotal.textContent   = pesoFmt(total);
+        edBalance.textContent = pesoFmt(balance);
+        edBalance.style.color = balance <= 0 ? 'var(--success)' : 'var(--danger)';
+    }
+    edWeight?.addEventListener('input', recalcEdit);
+    edPrice?.addEventListener('input', recalcEdit);
+    edPaid?.addEventListener('input', recalcEdit);
+
+    function openEdit(p) {
+        currentPurchase = p;
+        edId.value     = p.id;
+        edSeller.value = p.seller_name || '';
+        edWeight.value = p.weight_kg || '';
+        edPrice.value  = p.price_per_kg || '';
+        edPaid.value   = p.amount_paid || '';
+        edDate.value   = p.created_at ? p.created_at.slice(0, 10) : '';   // empty if no date
+        edNotes.value  = p.notes || '';
+
+        // If seller not in list, add it as an option
+        if (p.seller_name && ![...edSeller.options].some(o => o.value === p.seller_name)) {
+            const opt = document.createElement('option');
+            opt.value = p.seller_name;
+            opt.textContent = p.seller_name;
+            edSeller.appendChild(opt);
+        }
+        edSeller.value = p.seller_name || '';
+
+        recalcEdit();
+        const bodyEl = modalEdit.querySelector('.sp-modal-body');
+        if (bodyEl) bodyEl.scrollTop = 0;
+        openModal(modalEdit);
+    }
+
+    edForm?.addEventListener('submit', async (e) => {
+        e.preventDefault();
+
+        const payload = {
+            id:           parseInt(edId.value, 10),
+            seller_name:  edSeller.value.trim(),
+            weight_kg:    parseFloat(edWeight.value) || 0,
+            price_per_kg: parseFloat(edPrice.value)  || 0,
+            amount_paid:  parseFloat(edPaid.value)   || 0,
+            created_at:   edDate.value || '',
+            notes:        edNotes.value || '',
+        };
+
+        if (!payload.seller_name)      { showToast('Please select a seller.', 'error'); return; }
+        if (payload.weight_kg <= 0)    { showToast('Please enter a valid weight.', 'error'); return; }
+        if (payload.price_per_kg <= 0) { showToast('Please enter a valid price per kg.', 'error'); return; }
+
+        edSubmit.disabled = true;
+        const originalHtml = edSubmit.innerHTML;
+        edSubmit.innerHTML = '<span class="spinner-border spinner-border-sm"></span> Saving…';
+
+        try {
+            const res = await fetch('<?= BASE_URL ?>buyer/update_purchase.php', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload),
+            });
+            const data = await res.json().catch(() => ({}));
+            if (res.ok && data.success) {
+                showToast('Purchase updated!', 'success');
+                closeModal(modalEdit);
+                setTimeout(() => window.location.reload(), 700);
+            } else {
+                showToast(data.message || 'Could not update purchase.', 'error');
+            }
+        } catch (err) {
+            showToast('Network error. Please try again.', 'error');
+        } finally {
+            edSubmit.disabled = false;
+            edSubmit.innerHTML = originalHtml;
+        }
+    });
+
+    /* ----------------------------------------------------------
+       Delete flow
+    ---------------------------------------------------------- */
+    const dlRef        = document.getElementById('dlRef');
+    const dlAmount     = document.getElementById('dlAmount');
+    const dlConfirmBtn = document.getElementById('dlConfirmBtn');
+    const edDeleteBtn  = document.getElementById('edDeleteBtn');
+
+    function openDelete(p) {
+        currentPurchase = p;
+        dlRef.textContent    = p.reference_no || '—';
+        dlAmount.textContent = pesoFmt(p.total_amount);
+        openModal(modalDelete);
+    }
+
+    edDeleteBtn?.addEventListener('click', () => {
+        closeModal(modalEdit);
+        if (currentPurchase) setTimeout(() => openDelete(currentPurchase), 220);
+    });
+
+    dlConfirmBtn?.addEventListener('click', async () => {
+        if (!currentPurchase) return;
+
+        dlConfirmBtn.disabled = true;
+        const originalHtml = dlConfirmBtn.innerHTML;
+        dlConfirmBtn.innerHTML = '<span class="spinner-border spinner-border-sm"></span> Deleting…';
+
+        try {
+            const res = await fetch('<?= BASE_URL ?>buyer/delete_purchase.php', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ id: currentPurchase.id }),
+            });
+            const data = await res.json().catch(() => ({}));
+            if (res.ok && data.success) {
+                showToast('Purchase deleted.', 'success');
+                closeModal(modalDelete);
+                setTimeout(() => window.location.reload(), 700);
+            } else {
+                showToast(data.message || 'Could not delete purchase.', 'error');
+            }
+        } catch (err) {
+            showToast('Network error. Please try again.', 'error');
+        } finally {
+            dlConfirmBtn.disabled = false;
+            dlConfirmBtn.innerHTML = originalHtml;
+        }
+    });
+
+    /* ----------------------------------------------------------
+       Notification button
+    ---------------------------------------------------------- */
+    document.getElementById('notifBtn')?.addEventListener('click', () => {
+        showToast('No new notifications right now.', 'success');
+    });
+
+})();
+</script>
+</body>
+</html>
