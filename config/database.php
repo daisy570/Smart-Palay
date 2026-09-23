@@ -1,9 +1,29 @@
 <?php
-// Beginner-friendly database setup
-$host = 'localhost';
+// ============================================================
+// SmartPalay — Database + App Bootstrap
+// Works on XAMPP (localhost) and InfinityFree.
+// ------------------------------------------------------------
+// HOW TO DEPLOY ON INFINITYFREE (see deployment-steps.md):
+// 1. Control Panel > MySQL Databases > create DB, copy host/user/pass/name.
+// 2. Put those 4 values below (replace localhost/root//smartpalay).
+// 3. Upload files to htdocs/. Leave $APP_BASE_URL = '' for auto-detect.
+// ============================================================
+$host   = 'localhost';
 $dbUser = 'root';
 $dbPass = '';
 $dbName = 'smartpalay';
+
+// InfinityFree example (fill this in on the live site):
+// $host   = 'sqlXXX.infinityfree.com';
+// $dbUser = 'if0_12345678';
+// $dbPass = 'YourDbPassword';
+// $dbName = 'if0_12345678_smartpalay';
+
+// Set to '' for auto-detect (recommended).
+// Use '/' if files are directly in htdocs/, '/smartpalay/' if in htdocs/smartpalay/.
+$APP_BASE_URL = '';
+
+date_default_timezone_set('Asia/Manila');
 
 try {
     $pdo = new PDO(
@@ -17,38 +37,159 @@ try {
         ]
     );
 } catch (PDOException $e) {
-    die("Database connection failed: " . $e->getMessage());
+    http_response_code(500);
+    die("Database connection failed. Check config/database.php credentials and that the database exists.");
+}
+
+function sp_tableExists(PDO $pdo, string $table): bool {
+    try {
+        $stmt = $pdo->prepare("SHOW TABLES LIKE ?");
+        $stmt->execute([$table]);
+        return (bool) $stmt->fetchColumn();
+    } catch (Throwable $e) { return false; }
+}
+
+function sp_columnExists(PDO $pdo, string $table, string $column): bool {
+    try {
+        $stmt = $pdo->prepare("SHOW COLUMNS FROM `{$table}` LIKE ?");
+        $stmt->execute([$column]);
+        return (bool) $stmt->fetch();
+    } catch (Throwable $e) { return false; }
+}
+
+function sp_execQuiet(PDO $pdo, string $sql): void {
+    try { $pdo->exec($sql); } catch (Throwable $e) {}
+}
+
+// Creates missing tables and adds missing columns so a fresh
+// InfinityFree import (database/smartpalay.sql) works without manual SQL.
+function ensureAppSchema(PDO $pdo): void {
+    try {
+        // --- purchases (modern ledger, missing from old dump) ---
+        if (!sp_tableExists($pdo, 'purchases')) {
+            sp_execQuiet($pdo, "CREATE TABLE IF NOT EXISTS purchases (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                seller_id INT NULL,
+                buyer_id INT NULL,
+                buyer_name VARCHAR(150) NULL,
+                seller_name VARCHAR(150) NULL,
+                reference_no VARCHAR(50) NULL UNIQUE,
+                weight_kg DECIMAL(10,2) NOT NULL DEFAULT 0,
+                price_per_kg DECIMAL(10,2) NOT NULL DEFAULT 0,
+                total_amount DECIMAL(12,2) NOT NULL DEFAULT 0,
+                amount_paid DECIMAL(12,2) NOT NULL DEFAULT 0,
+                balance DECIMAL(12,2) NOT NULL DEFAULT 0,
+                status VARCHAR(20) NOT NULL DEFAULT 'unpaid',
+                notes TEXT NULL,
+                created_at DATETIME NULL DEFAULT CURRENT_TIMESTAMP,
+                INDEX idx_purchases_seller (seller_id),
+                INDEX idx_purchases_buyer (buyer_id)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+        } else {
+            if (!sp_columnExists($pdo, 'purchases', 'buyer_name')) sp_execQuiet($pdo, "ALTER TABLE purchases ADD COLUMN buyer_name VARCHAR(150) NULL AFTER seller_id");
+            if (!sp_columnExists($pdo, 'purchases', 'seller_name')) sp_execQuiet($pdo, "ALTER TABLE purchases ADD COLUMN seller_name VARCHAR(150) NULL AFTER buyer_name");
+            if (!sp_columnExists($pdo, 'purchases', 'amount_paid')) sp_execQuiet($pdo, "ALTER TABLE purchases ADD COLUMN amount_paid DECIMAL(12,2) NOT NULL DEFAULT 0 AFTER total_amount");
+            if (!sp_columnExists($pdo, 'purchases', 'reference_no')) sp_execQuiet($pdo, "ALTER TABLE purchases ADD COLUMN reference_no VARCHAR(50) NULL AFTER seller_name");
+            if (!sp_columnExists($pdo, 'purchases', 'notes')) sp_execQuiet($pdo, "ALTER TABLE purchases ADD COLUMN notes TEXT NULL");
+            try {
+                $info = $pdo->query("SHOW COLUMNS FROM purchases LIKE 'buyer_id'")->fetch(PDO::FETCH_ASSOC);
+                if ($info && stripos($info['Type'] ?? '', 'int') !== false && strtolower((string)($info['Null'] ?? 'NO')) !== 'yes') {
+                    sp_execQuiet($pdo, "ALTER TABLE purchases MODIFY buyer_id INT NULL");
+                }
+                $info2 = $pdo->query("SHOW COLUMNS FROM purchases LIKE 'seller_id'")->fetch(PDO::FETCH_ASSOC);
+                if ($info2 && stripos($info2['Type'] ?? '', 'int') !== false && strtolower((string)($info2['Null'] ?? 'NO')) !== 'yes') {
+                    sp_execQuiet($pdo, "ALTER TABLE purchases MODIFY seller_id INT NULL");
+                }
+            } catch (Throwable $e) {}
+        }
+
+        // --- payments: extend legacy table (transaction_id/payment_date) with modern columns ---
+        if (sp_tableExists($pdo, 'payments')) {
+            if (!sp_columnExists($pdo, 'payments', 'seller_id')) sp_execQuiet($pdo, "ALTER TABLE payments ADD COLUMN seller_id INT NULL AFTER id");
+            if (!sp_columnExists($pdo, 'payments', 'buyer_id')) sp_execQuiet($pdo, "ALTER TABLE payments ADD COLUMN buyer_id INT NULL AFTER seller_id");
+            if (!sp_columnExists($pdo, 'payments', 'purchase_id')) sp_execQuiet($pdo, "ALTER TABLE payments ADD COLUMN purchase_id INT NULL AFTER buyer_id");
+            if (!sp_columnExists($pdo, 'payments', 'purchase_ref')) sp_execQuiet($pdo, "ALTER TABLE payments ADD COLUMN purchase_ref VARCHAR(50) NULL AFTER purchase_id");
+            if (!sp_columnExists($pdo, 'payments', 'reference_no')) sp_execQuiet($pdo, "ALTER TABLE payments ADD COLUMN reference_no VARCHAR(50) NULL AFTER purchase_ref");
+            if (!sp_columnExists($pdo, 'payments', 'paid_at')) sp_execQuiet($pdo, "ALTER TABLE payments ADD COLUMN paid_at DATETIME NULL AFTER notes");
+            // Legacy columns stay untouched so old data is preserved.
+        }
+
+        // --- user_preferences (used by seller/buyer settings) ---
+        if (!sp_tableExists($pdo, 'user_preferences')) {
+            sp_execQuiet($pdo, "CREATE TABLE IF NOT EXISTS user_preferences (
+                user_id INT NOT NULL PRIMARY KEY,
+                notify_email TINYINT(1) NOT NULL DEFAULT 1,
+                notify_sms TINYINT(1) NOT NULL DEFAULT 0,
+                notify_payments TINYINT(1) NOT NULL DEFAULT 1,
+                notify_purchases TINYINT(1) NOT NULL DEFAULT 1,
+                language VARCHAR(10) NOT NULL DEFAULT 'en',
+                timezone VARCHAR(50) NOT NULL DEFAULT 'Asia/Manila',
+                theme VARCHAR(20) NOT NULL DEFAULT 'warm'
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+        }
+
+        // --- settings (used by admin/settings) ---
+        if (!sp_tableExists($pdo, 'settings')) {
+            sp_execQuiet($pdo, "CREATE TABLE IF NOT EXISTS settings (
+                key_name VARCHAR(100) NOT NULL PRIMARY KEY,
+                key_value TEXT NULL
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+        }
+
+        // --- users.avatar + buyers.avatar (used by profile pages) ---
+        if (sp_tableExists($pdo, 'users') && !sp_columnExists($pdo, 'users', 'avatar')) {
+            sp_execQuiet($pdo, "ALTER TABLE users ADD COLUMN avatar VARCHAR(255) NULL AFTER address");
+        }
+        if (sp_tableExists($pdo, 'buyers') && !sp_columnExists($pdo, 'buyers', 'avatar')) {
+            sp_execQuiet($pdo, "ALTER TABLE buyers ADD COLUMN avatar VARCHAR(255) NULL AFTER business_address");
+        }
+
+        // --- sellers table: dump defines seller-profile schema (user_id/farm_*),
+        // --- but buyer/sellers.php needs directory schema (buyer_id/name/contact).
+        // --- Keep both by adding missing columns; existing data is preserved.
+        if (sp_tableExists($pdo, 'sellers')) {
+            if (!sp_columnExists($pdo, 'sellers', 'buyer_id')) sp_execQuiet($pdo, "ALTER TABLE sellers ADD COLUMN buyer_id INT NULL AFTER user_id");
+            if (!sp_columnExists($pdo, 'sellers', 'name')) sp_execQuiet($pdo, "ALTER TABLE sellers ADD COLUMN name VARCHAR(150) NULL AFTER buyer_id");
+            if (!sp_columnExists($pdo, 'sellers', 'contact')) sp_execQuiet($pdo, "ALTER TABLE sellers ADD COLUMN contact VARCHAR(100) NULL AFTER name");
+            if (!sp_columnExists($pdo, 'sellers', 'address')) sp_execQuiet($pdo, "ALTER TABLE sellers ADD COLUMN address TEXT NULL AFTER contact");
+            if (!sp_columnExists($pdo, 'sellers', 'notes')) sp_execQuiet($pdo, "ALTER TABLE sellers ADD COLUMN notes TEXT NULL AFTER address");
+            // Allow profile rows without user_id (buyer directory rows use buyer_id instead).
+            try {
+                $u = $pdo->query("SHOW COLUMNS FROM sellers LIKE 'user_id'")->fetch(PDO::FETCH_ASSOC);
+                if ($u && strtolower((string)($u['Null'] ?? 'NO')) !== 'yes') {
+                    sp_execQuiet($pdo, "ALTER TABLE sellers MODIFY user_id INT NULL");
+                }
+            } catch (Throwable $e) {}
+        }
+
+        // --- uploads folder (avatars disappear on GitHub ZIP if empty) ---
+        $avatarDir = dirname(__DIR__) . '/uploads/avatars/';
+        if (!is_dir($avatarDir)) { @mkdir($avatarDir, 0755, true); }
+    } catch (Throwable $e) {}
 }
 
 function ensurePurchasesSchema(PDO $pdo): void {
-    try {
-        $columns = $pdo->query("SHOW COLUMNS FROM purchases")->fetchAll(PDO::FETCH_COLUMN);
-        $colSet = array_fill_keys(array_map('strtolower', $columns), true);
-
-        if (!isset($colSet['buyer_name'])) {
-            $pdo->exec("ALTER TABLE purchases ADD COLUMN buyer_name VARCHAR(150) NULL AFTER seller_id");
-        }
-
-        if (!isset($colSet['amount_paid'])) {
-            $pdo->exec("ALTER TABLE purchases ADD COLUMN amount_paid DECIMAL(12,2) NOT NULL DEFAULT 0 AFTER total_amount");
-        }
-
-        $buyerIdInfo = $pdo->query("SHOW COLUMNS FROM purchases LIKE 'buyer_id'")->fetch(PDO::FETCH_ASSOC);
-        if ($buyerIdInfo && stripos($buyerIdInfo['Type'] ?? '', 'int') !== false) {
-            $nullable = strtolower((string) ($buyerIdInfo['Null'] ?? 'NO'));
-            if ($nullable !== 'yes') {
-                $pdo->exec("ALTER TABLE purchases MODIFY buyer_id INT NULL");
-            }
-        }
-    } catch (Throwable $e) {
-        // Ignore schema migration errors during startup if the table is unavailable.
-    }
+    ensureAppSchema($pdo);
 }
 
-ensurePurchasesSchema($pdo);
+ensureAppSchema($pdo);
 
-// Base URL
-define('BASE_URL', '/smartpalay/');
+// Base URL: '' = auto-detect from document root (XAMPP + InfinityFree safe).
+if (!defined('BASE_URL')) {
+    $detectedBase = '/smartpalay/';
+    if ($APP_BASE_URL !== '') {
+        $detectedBase = '/' . trim($APP_BASE_URL, '/') . '/';
+        if ($detectedBase === '//') $detectedBase = '/';
+    } elseif (PHP_SAPI !== 'cli' && isset($_SERVER['DOCUMENT_ROOT'])) {
+        $docRoot = rtrim(str_replace('\\', '/', (string)$_SERVER['DOCUMENT_ROOT']), '/');
+        $appRoot = str_replace('\\', '/', dirname(__DIR__));
+        if ($docRoot !== '' && strpos($appRoot, $docRoot) === 0) {
+            $rel = trim(substr($appRoot, strlen($docRoot)), '/');
+            $detectedBase = $rel === '' ? '/' : '/' . $rel . '/';
+        }
+    }
+    define('BASE_URL', $detectedBase);
+}
 
 if (PHP_SAPI !== 'cli' && isset($_SERVER['REQUEST_URI'])) {
     $requestPath = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH) ?: '';

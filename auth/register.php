@@ -19,11 +19,12 @@ $bgUrl      = is_file($bgDiskPath)
     ? BASE_URL . 'images/' . rawurlencode($bgFileName)
     : '';
 
-// Social providers
+// Social providers (hidden automatically on InfinityFree/live if auth/oauth.php is missing)
+$hasOauth = is_file(__DIR__ . '/oauth.php');
 $socialEnabled = [
-    'google'    => true,
-    'facebook'  => true,
-    'microsoft' => true,
+    'google'    => $hasOauth,
+    'facebook'  => $hasOauth,
+    'microsoft' => $hasOauth,
 ];
 
 // Allowed roles
